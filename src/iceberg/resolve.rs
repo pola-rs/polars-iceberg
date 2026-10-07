@@ -10,7 +10,7 @@ use crate::iceberg::arrow_types::{null_count_dtype, table_fields, value_dtype};
 use crate::iceberg::avro::Datum;
 use crate::iceberg::error::{IcebergResult, err_invalid_data, err_not_implemented};
 use crate::iceberg::expr::bind;
-use crate::iceberg::host::{Host, Storage};
+use crate::iceberg::host::{Host, Storage, normalize_path};
 use crate::iceberg::output::{DeleteKind, DeleteRef, FilesTable, Resolved};
 use crate::iceberg::planner::{FileTask, PlanOptions, plan_files, resolve_selection};
 use crate::iceberg::prune::Pruner;
@@ -258,14 +258,6 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         constant_errors,
         initial_defaults,
     })
-}
-
-/// PyIceberg on Windows uses `file://C:/` rather than `file:///C:/`.
-fn normalize_path(path: &str) -> String {
-    match path.strip_prefix("file://") {
-        Some(rest) if !rest.starts_with('/') => format!("file:///{rest}"),
-        _ => path.to_owned(),
-    }
 }
 
 /// Identity-partition values of projected fields, one value per file. Mirrors

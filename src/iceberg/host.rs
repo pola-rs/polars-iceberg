@@ -31,7 +31,8 @@ impl Host {
     }
 
     pub async fn get_storage(&self, url: &str) -> PluginResult<Storage> {
-        let fut = unsafe { (self.vtable.get_storage)(self.vtable.ctx, FfiStr::new(url)) };
+        let url = normalize_path(url);
+        let fut = unsafe { (self.vtable.get_storage)(self.vtable.ctx, FfiStr::new(&url)) };
         let handle = fut.await.into_result()?;
         Ok(Storage(Arc::new(StorageInner {
             host: *self,
@@ -64,13 +65,23 @@ pub struct Storage(Arc<StorageInner>);
 
 impl Storage {
     pub async fn get(&self, url: &str) -> PluginResult<FfiBuf> {
-        let fut = unsafe { (self.0.host.vtable.storage_get)(self.0.handle, FfiStr::new(url)) };
+        let url = normalize_path(url);
+        let fut = unsafe { (self.0.host.vtable.storage_get)(self.0.handle, FfiStr::new(&url)) };
         fut.await.into_result()
     }
 
     /// Size of the object in bytes.
     pub async fn head(&self, url: &str) -> PluginResult<u64> {
-        let fut = unsafe { (self.0.host.vtable.storage_head)(self.0.handle, FfiStr::new(url)) };
+        let url = normalize_path(url);
+        let fut = unsafe { (self.0.host.vtable.storage_head)(self.0.handle, FfiStr::new(&url)) };
         fut.await.into_result()
+    }
+}
+
+/// PyIceberg on Windows uses `file://C:/` rather than `file:///C:/`.
+pub fn normalize_path(path: &str) -> String {
+    match path.strip_prefix("file://") {
+        Some(rest) if !rest.starts_with('/') => format!("file:///{rest}"),
+        _ => path.to_owned(),
     }
 }
