@@ -9,7 +9,8 @@ pub fn err_invalid_data(msg: impl Into<String>) -> FfiError {
     FfiError::new(FfiErrorKind::OTHER, format!("iceberg: {}", msg.into()))
 }
 
-/// A table feature this plugin does not support. Never falls back to another planner.
+/// A table feature this plugin does not support. Raised as `NotImplementedError` in Python, on
+/// which Polars plans the scan with PyIceberg unless `POLARS_ICEBERG_PLANNER=plugin` is set.
 pub fn err_not_implemented(msg: impl Into<String>) -> FfiError {
     FfiError::new(
         FfiErrorKind::NOT_IMPLEMENTED,

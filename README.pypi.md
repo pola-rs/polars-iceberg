@@ -4,10 +4,10 @@ This package is a dependency of [Polars](https://pypi.org/project/polars/) and i
 used directly. It contains the native Iceberg scan planning plugin that `polars.scan_iceberg`
 uses.
 
-To install it, install Polars with the `polars_iceberg` extra:
+To install it, install Polars with the `iceberg` extra:
 
 ```bash
-pip install 'polars[polars_iceberg]'
+pip install 'polars[iceberg]'
 ```
 
 See the [Polars documentation](https://docs.pola.rs/) and the

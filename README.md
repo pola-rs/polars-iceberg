@@ -33,8 +33,8 @@ Releases are done from the Polars repository:
 1. Bump `project.version` in `pyproject.toml` on `main` and push a tag for it.
 2. Run Polars' `release-polars-iceberg` workflow with that tag. It builds the sdist and abi3
    wheels (one per target) in the Polars workspace and publishes them to PyPI.
-3. To make Polars require the release, update the `polars_iceberg` optional dependency in Polars'
-   `py-polars/pyproject.toml` (`polars-iceberg >= <version>, < <next major version>`). Polars'
+3. To make Polars require the release, update the `polars-iceberg >= <version>, < <next major
+   version>` requirement in the `iceberg` extra of Polars' `py-polars/pyproject.toml`. Polars'
    Python release workflow runs its test suite against that lower bound installed from PyPI.
 
 The PyPI project page is `README.pypi.md`.
