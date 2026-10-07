@@ -21,9 +21,20 @@ make -C py-polars test                  # also builds the plugin
 ## Branches and CI
 
 - `dev`: development branch. Polars pull request and push CI clones it.
-- `main`: release branch. Releases are tagged `py-<version>` (matching the version in `Cargo.toml`).
+- `main`: release branch. Releases are tagged (e.g. `py-0.1.0`) from it.
 
-Releases are done from the Polars repository: the `polars_iceberg` optional dependency in
-`py-polars/pyproject.toml` (`polars-iceberg >= <version>`) selects the tag. Polars'
-`release-polars-iceberg` workflow builds and publishes that tag to PyPI, and its Python release
-workflow runs the test suite against that version installed from PyPI.
+The released version is `project.version` in `pyproject.toml`; `Cargo.toml`'s version is not
+used for releases.
+
+## Releasing
+
+Releases are done from the Polars repository:
+
+1. Bump `project.version` in `pyproject.toml` on `main` and push a tag for it.
+2. Run Polars' `release-polars-iceberg` workflow with that tag. It builds the sdist and abi3
+   wheels (one per target) in the Polars workspace and publishes them to PyPI.
+3. To make Polars require the release, update the `polars_iceberg` optional dependency in Polars'
+   `py-polars/pyproject.toml` (`polars-iceberg >= <version>, < <next major version>`). Polars'
+   Python release workflow runs its test suite against that lower bound installed from PyPI.
+
+The PyPI project page is `README.pypi.md`.
