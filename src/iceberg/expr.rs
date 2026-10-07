@@ -118,19 +118,6 @@ impl Bound {
         }
     }
 
-    fn negate(self) -> Bound {
-        match self {
-            Bound::True => Bound::False,
-            Bound::False => Bound::True,
-            Bound::And(a, b) => Bound::or(a.negate(), b.negate()),
-            Bound::Or(a, b) => Bound::and(a.negate(), b.negate()),
-            Bound::Pred(mut p) => {
-                p.op = p.op.negate();
-                Bound::Pred(p)
-            },
-        }
-    }
-
     /// Field IDs referenced by predicates.
     pub fn field_ids(&self, out: &mut Vec<i32>) {
         match self {
@@ -218,11 +205,12 @@ fn bind_impl(json: &JsonValue, schema: &Schema, negated: bool) -> Option<Bound> 
         _ => return None,
     };
 
-    let pred = bind_predicate(obj, op, schema)?;
-    Some(if negated { pred.negate() } else { pred })
+    // Negated before binding: binding may widen literals (see `literal_range`), and a widened
+    // predicate cannot be negated.
+    bind_predicate(obj, if negated { op.negate() } else { op }, schema)
 }
 
-/// A predicate bound to `schema` (contains no unbindable parts, so it is safe to negate).
+/// A predicate bound to `schema`.
 fn bind_predicate(
     obj: &serde_json::Map<String, JsonValue>,
     op: Op,
@@ -231,17 +219,6 @@ fn bind_predicate(
     let field = resolve_term(obj.get("term")?, schema)?;
     let Type::Primitive(pt) = &field.field_type else {
         return None;
-    };
-
-    let lits = match op {
-        Op::IsNull | Op::NotNull | Op::IsNan | Op::NotNan => vec![],
-        Op::In | Op::NotIn => obj
-            .get("values")?
-            .as_array()?
-            .iter()
-            .map(|v| convert_literal(v, pt))
-            .collect::<Option<Vec<_>>>()?,
-        _ => vec![convert_literal(obj.get("value")?, pt)?],
     };
 
     // Unary predicates that cannot hold for the type (e.g. NaN checks on non-float columns).
@@ -254,12 +231,62 @@ fn bind_predicate(
         _ => {},
     }
 
-    Some(Bound::Pred(Predicate {
-        field_id: field.id,
-        ty: pt.clone(),
-        op,
-        lits,
-    }))
+    let ranges = match op {
+        Op::IsNull | Op::NotNull | Op::IsNan | Op::NotNan => vec![],
+        Op::In | Op::NotIn => obj
+            .get("values")?
+            .as_array()?
+            .iter()
+            .map(|v| literal_range(v, pt))
+            .collect::<Option<Vec<_>>>()?,
+        _ => vec![literal_range(obj.get("value")?, pt)?],
+    };
+
+    let pred = |op: Op, lits: Vec<Lit>| {
+        Bound::Pred(Predicate {
+            field_id: field.id,
+            ty: pt.clone(),
+            op,
+            lits,
+        })
+    };
+
+    if ranges.iter().all(|(lo, hi)| lo == hi) {
+        return Some(pred(op, ranges.into_iter().map(|(lo, _)| lo).collect()));
+    }
+
+    // Some literal stands for any value in `lo..=hi`: keep what any of them might match.
+    Some(match op {
+        Op::Lt | Op::LtEq => pred(Op::LtEq, vec![ranges[0].1.clone()]),
+        Op::Gt | Op::GtEq => pred(op, vec![ranges[0].0.clone()]),
+        Op::Eq | Op::In => ranges.into_iter().fold(Bound::False, |acc, (lo, hi)| {
+            Bound::or(
+                acc,
+                Bound::and(pred(Op::GtEq, vec![lo]), pred(Op::LtEq, vec![hi])),
+            )
+        }),
+        _ => Bound::True,
+    })
+}
+
+/// The range of values a JSON literal may stand for, converted to `ty`. Exact, except for
+/// nanosecond timestamps given with at most microsecond precision: Polars builds datetime
+/// literals through Python `datetime`, which floors nanoseconds to microseconds
+/// (`to_py_datetime`), so up to 999 ns may have been dropped.
+fn literal_range(v: &JsonValue, ty: &PrimitiveType) -> Option<(Lit, Lit)> {
+    let lit = convert_literal(v, ty)?;
+    if let (PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs, JsonValue::String(s)) =
+        (ty, v)
+        && let Lit::Int(ns) = lit
+    {
+        let fraction_digits = s
+            .split_once('.')
+            .map_or(0, |(_, f)| f.bytes().take_while(u8::is_ascii_digit).count());
+        if fraction_digits <= 6 {
+            return Some((lit, Lit::Int(ns.checked_add(999)?)));
+        }
+    }
+    Some((lit.clone(), lit))
 }
 
 /// A term is a (possibly dotted) column name, or `{"type": "reference", "term": name}`.
@@ -381,4 +408,111 @@ fn parse_decimal(s: &str, scale: u32) -> Option<i128> {
         value = value.checked_mul(10)?.checked_add(digit)?;
     }
     Some(if negative { -value } else { value })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn schema() -> Schema {
+        let field = |id, name: &str, ty| NestedField {
+            id,
+            name: name.into(),
+            required: false,
+            field_type: Type::Primitive(ty),
+            initial_default: None,
+        };
+        Schema::new(
+            0,
+            vec![
+                field(1, "ts_ns", PrimitiveType::TimestampNs),
+                field(2, "ts_us", PrimitiveType::Timestamp),
+            ],
+        )
+    }
+
+    fn pred(bound: &Bound) -> (Op, &[Lit]) {
+        match bound {
+            Bound::Pred(p) => (p.op, &p.lits),
+            other => panic!("expected a predicate, got {other:?}"),
+        }
+    }
+
+    // 2020-01-01T00:00:00.000001 in nanoseconds.
+    const LO: i64 = 1_577_836_800_000_001_000;
+    const HI: i64 = LO + 999;
+
+    #[test]
+    fn microsecond_literal_on_nanosecond_column_is_widened() {
+        let schema = schema();
+        let bind = |op: &str| {
+            bind(
+                &json!({"type": op, "term": "ts_ns", "value": "2020-01-01T00:00:00.000001"}),
+                &schema,
+            )
+        };
+
+        assert_eq!(pred(&bind("lt")), (Op::LtEq, &[Lit::Int(HI)][..]));
+        assert_eq!(pred(&bind("lt-eq")), (Op::LtEq, &[Lit::Int(HI)][..]));
+        assert_eq!(pred(&bind("gt")), (Op::Gt, &[Lit::Int(LO)][..]));
+        assert_eq!(pred(&bind("gt-eq")), (Op::GtEq, &[Lit::Int(LO)][..]));
+        assert!(matches!(bind("not-eq"), Bound::True));
+
+        let Bound::And(lo, hi) = bind("eq") else {
+            panic!("expected a range");
+        };
+        assert_eq!(pred(&lo), (Op::GtEq, &[Lit::Int(LO)][..]));
+        assert_eq!(pred(&hi), (Op::LtEq, &[Lit::Int(HI)][..]));
+    }
+
+    #[test]
+    fn widened_literal_is_negated_before_widening() {
+        let schema = schema();
+        // `NOT (x < L)` is `x >= L`, so the lower end of the range applies.
+        let bound = bind(
+            &json!({"type": "not", "child":
+                {"type": "lt", "term": "ts_ns", "value": "2020-01-01T00:00:00.000001"}}),
+            &schema,
+        );
+        assert_eq!(pred(&bound), (Op::GtEq, &[Lit::Int(LO)][..]));
+    }
+
+    #[test]
+    fn exact_literals_are_not_widened() {
+        let schema = schema();
+        let bound = bind(
+            &json!({"type": "lt", "term": "ts_ns", "value": "2020-01-01T00:00:00.000001000"}),
+            &schema,
+        );
+        assert_eq!(pred(&bound), (Op::Lt, &[Lit::Int(LO)][..]));
+
+        let bound = bind(
+            &json!({"type": "eq", "term": "ts_us", "value": "2020-01-01T00:00:00.000001"}),
+            &schema,
+        );
+        assert_eq!(
+            pred(&bound),
+            (Op::Eq, &[Lit::Int(1_577_836_800_000_001)][..])
+        );
+    }
+
+    #[test]
+    fn float_literals_parse_exactly() {
+        // Without serde_json's `float_roundtrip`, these parse one ULP off.
+        for (text, expected) in [
+            ("123456789.98765433", 123456789.98765433_f64),
+            (
+                "339999995214436424907732413799364296704",
+                3.3999999521443642e38,
+            ),
+        ] {
+            let v: JsonValue = serde_json::from_str(text).unwrap();
+            assert_eq!(
+                convert_literal(&v, &PrimitiveType::Double),
+                Some(Lit::Float(expected))
+            );
+        }
+    }
 }
