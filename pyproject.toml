@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "polars-iceberg"
+description = "Native Iceberg scan planning plugin for Polars (dependency of the polars package)"
+readme = "README.pypi.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+version = "0.1.0"
+
+[project.urls]
+Homepage = "https://www.pola.rs/"
+Polars = "https://pypi.org/project/polars/"
+Repository = "https://github.com/pola-rs/polars-iceberg"
+
+[tool.maturin]
+features = ["python", "iceberg"]
+module-name = "polars_iceberg"
