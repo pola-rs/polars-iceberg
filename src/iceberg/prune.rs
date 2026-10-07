@@ -182,17 +182,42 @@ fn project_predicate(p: &Predicate, idx: usize, transform: &Transform) -> Bound 
         Transform::Identity => with(p.op, p.lits.clone(), p.ty.clone()),
         Transform::Year | Transform::Month | Transform::Day | Transform::Hour => {
             let t = |l: &Lit| temporal(transform, &p.ty, l);
-            // Transforms are monotonic (floor), so `x < v` implies `t(x) <= t(v)`.
-            let (op, lits) = match p.op {
-                Op::Lt | Op::LtEq => (Op::LtEq, apply_all(&t)),
-                Op::Gt | Op::GtEq => (Op::GtEq, apply_all(&t)),
-                Op::Eq => (Op::Eq, apply_all(&t)),
-                Op::In => (Op::In, apply_all(&t)),
-                _ => return Bound::True,
+            let Some(lits) = apply_all(&t) else {
+                return Bound::True;
             };
-            match lits {
-                Some(lits) => with(op, lits, PrimitiveType::Int),
-                None => Bound::True,
+            // Older Java writers rounded pre-epoch values toward zero instead of down, so a
+            // negative partition value may be one above `t(v)`. As in Java's
+            // `ProjectionUtil.fixInclusiveTimeProjection`, upper bounds and equalities on
+            // negative values also accept `t(v) + 1`.
+            let fix_negative = match transform {
+                Transform::Year | Transform::Month => true,
+                _ => !matches!(p.ty, PrimitiveType::Date),
+            };
+            let bumped = |v: &Lit| match v {
+                Lit::Int(v) if fix_negative && *v < 0 => Some(Lit::Int(v + 1)),
+                _ => None,
+            };
+            // Transforms are monotonic (floor), so `x < v` implies `t(x) <= t(v)`.
+            match p.op {
+                Op::Lt | Op::LtEq => {
+                    let lits = lits.iter().map(|l| bumped(l).unwrap_or_else(|| l.clone()));
+                    with(Op::LtEq, lits.collect(), PrimitiveType::Int)
+                },
+                Op::Gt | Op::GtEq => with(Op::GtEq, lits, PrimitiveType::Int),
+                Op::Eq | Op::In => {
+                    let extra: Vec<Lit> = lits.iter().filter_map(bumped).collect();
+                    let op = if p.op == Op::Eq && extra.is_empty() {
+                        Op::Eq
+                    } else {
+                        Op::In
+                    };
+                    with(
+                        op,
+                        lits.into_iter().chain(extra).collect(),
+                        PrimitiveType::Int,
+                    )
+                },
+                _ => Bound::True,
             }
         },
         Transform::Truncate(width) => {
@@ -472,4 +497,73 @@ fn datum_to_lit(d: &Datum, ty: &PrimitiveType) -> Option<Lit> {
         (Datum::Bytes(b), _) => Lit::Bytes(b.clone()),
         (Datum::String(s), _) => Lit::Bytes(s.as_bytes().to_vec()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project_one(op: Op, ty: PrimitiveType, lits: Vec<Lit>, transform: Transform) -> Bound {
+        let p = Predicate {
+            field_id: 1,
+            ty,
+            op,
+            lits,
+        };
+        project_predicate(&p, 0, &transform)
+    }
+
+    fn pred(bound: &Bound) -> (Op, Vec<Lit>) {
+        match bound {
+            Bound::Pred(p) => (p.op, p.lits.clone()),
+            other => panic!("expected a predicate, got {other:?}"),
+        }
+    }
+
+    // 1969-12-31T12:00:00 in microseconds: day -1.
+    const PRE_EPOCH_US: i64 = -12 * 3_600_000_000;
+
+    #[test]
+    fn negative_time_projection_accepts_values_rounded_toward_zero() {
+        let ts = PrimitiveType::Timestamp;
+        let lit = || vec![Lit::Int(PRE_EPOCH_US)];
+
+        let bound = project_one(Op::Lt, ts.clone(), lit(), Transform::Day);
+        assert_eq!(pred(&bound), (Op::LtEq, vec![Lit::Int(0)]));
+
+        let bound = project_one(Op::Eq, ts.clone(), lit(), Transform::Day);
+        assert_eq!(pred(&bound), (Op::In, vec![Lit::Int(-1), Lit::Int(0)]));
+
+        let bound = project_one(Op::In, ts.clone(), lit(), Transform::Hour);
+        assert_eq!(pred(&bound), (Op::In, vec![Lit::Int(-12), Lit::Int(-11)]));
+
+        // Lower bounds are unaffected: rounding toward zero only increases negative values.
+        let bound = project_one(Op::GtEq, ts.clone(), lit(), Transform::Day);
+        assert_eq!(pred(&bound), (Op::GtEq, vec![Lit::Int(-1)]));
+
+        // Non-negative values are exact.
+        let bound = project_one(Op::Eq, ts, vec![Lit::Int(0)], Transform::Day);
+        assert_eq!(pred(&bound), (Op::Eq, vec![Lit::Int(0)]));
+    }
+
+    #[test]
+    fn negative_date_projection() {
+        // 1969-12-31: month -1.
+        let bound = project_one(
+            Op::Eq,
+            PrimitiveType::Date,
+            vec![Lit::Int(-1)],
+            Transform::Month,
+        );
+        assert_eq!(pred(&bound), (Op::In, vec![Lit::Int(-1), Lit::Int(0)]));
+
+        // `day` of a date is the date itself: no adjustment.
+        let bound = project_one(
+            Op::Eq,
+            PrimitiveType::Date,
+            vec![Lit::Int(-1)],
+            Transform::Day,
+        );
+        assert_eq!(pred(&bound), (Op::Eq, vec![Lit::Int(-1)]));
+    }
 }

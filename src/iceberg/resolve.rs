@@ -81,7 +81,9 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         .filter(|_| request.use_metadata_statistics)
         .map(|columns| schema.select(columns));
 
-    let pruner_schema = table.current_schema()?.clone();
+    // Filter column names refer to the scanned schema (the snapshot's schema when time
+    // travelling), not the current one: a column may have been renamed since.
+    let pruner_schema = schema.clone();
     let row_filter = query
         .row_filter
         .as_deref()
@@ -123,6 +125,9 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
     let mut total_deleted_rows: u64 = 0;
     let mut num_position_delete_files = 0;
     let mut num_deletion_vectors = 0;
+    // A position delete file may apply to several data files (partition-scoped), but its rows
+    // are counted once.
+    let mut counted_position_deletes: PlHashSet<&str> = PlHashSet::default();
 
     for task in &tasks {
         let file = &task.file;
@@ -134,8 +139,8 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         }
 
         let mut position_deletes = vec![];
+        let mut position_delete_files = vec![];
         let mut deletion_vector = None;
-        let mut position_delete_rows: u64 = 0;
         let mut deletion_vector_rows: u64 = 0;
 
         for delete in &task.deletes {
@@ -145,7 +150,7 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                         kind: DeleteKind::Position,
                         path: normalize_path(&delete.file_path),
                     });
-                    position_delete_rows += delete.record_count as u64;
+                    position_delete_files.push(delete);
                 },
                 "PUFFIN" => {
                     if deletion_vector.is_some() {
@@ -177,7 +182,11 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                 vec![dv]
             },
             None => {
-                total_deleted_rows += position_delete_rows;
+                for delete in position_delete_files {
+                    if counted_position_deletes.insert(delete.file_path.as_str()) {
+                        total_deleted_rows += delete.record_count as u64;
+                    }
+                }
                 num_position_delete_files += position_deletes.len();
                 position_deletes
             },

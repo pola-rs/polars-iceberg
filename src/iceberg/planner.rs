@@ -106,7 +106,7 @@ pub struct PlanOptions {
     pub stats_field_ids: PlHashSet<i32>,
     /// Row filter for pruning manifests and data files, bound to `pruner_schema`.
     pub pruner: Option<Pruner>,
-    /// Schema the pruner's filter is bound to (the current table schema).
+    /// Schema the pruner's filter is bound to (the scanned schema).
     pub pruner_schema: Arc<Schema>,
 }
 
