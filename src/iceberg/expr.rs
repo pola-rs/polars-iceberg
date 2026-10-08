@@ -10,6 +10,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::Value as JsonValue;
 
 use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use crate::iceberg::values::parse_decimal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -375,39 +376,6 @@ pub fn convert_literal(v: &JsonValue, ty: &PrimitiveType) -> Option<Lit> {
         },
         _ => None,
     }
-}
-
-/// Parse a decimal string into an unscaled integer; `None` if it has more digits than `scale`
-/// after the decimal point.
-fn parse_decimal(s: &str, scale: u32) -> Option<i128> {
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
-    };
-    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
-    let frac_part = frac_part.trim_end_matches('0');
-    if frac_part.len() > scale as usize
-        || int_part.is_empty() && frac_part.is_empty()
-        || !int_part
-            .chars()
-            .chain(frac_part.chars())
-            .all(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-    let mut value: i128 = if int_part.is_empty() {
-        0
-    } else {
-        int_part.parse().ok()?
-    };
-    for i in 0..scale as usize {
-        let digit = frac_part
-            .as_bytes()
-            .get(i)
-            .map_or(0, |b| i128::from(b - b'0'));
-        value = value.checked_mul(10)?.checked_add(digit)?;
-    }
-    Some(if negative { -value } else { value })
 }
 
 #[cfg(test)]

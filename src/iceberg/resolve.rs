@@ -1,6 +1,7 @@
 //! The `plan` entry point: `resolve()` turns the planned files into the output contract of [`crate::iceberg::output`]. The
 //! per-file data (identity-partition constants, `initial-default`s, statistics, deletes, row
 //! count) follows the Python resolver (`IcebergScanResolver._to_dataset_scan_impl`).
+use std::borrow::Cow;
 use std::time::Instant;
 
 use polars_arrow::array::{Array, PrimitiveArray, new_null_array};
@@ -8,11 +9,13 @@ use polars_utils::aliases::{PlHashMap, PlHashSet};
 
 use crate::iceberg::arrow_types::{null_count_dtype, table_fields, value_dtype};
 use crate::iceberg::avro::Datum;
-use crate::iceberg::error::{IcebergResult, err_invalid_data, err_not_implemented};
+use crate::iceberg::error::{IcebergResult, err_invalid_data, err_not_implemented, with_context};
 use crate::iceberg::expr::bind;
 use crate::iceberg::host::{Host, Storage, normalize_path};
 use crate::iceberg::output::{DeleteKind, DeleteRef, FilesTable, Resolved};
-use crate::iceberg::planner::{FileTask, PlanOptions, plan_files, resolve_selection};
+use crate::iceberg::planner::{
+    FileTask, PlanOptions, plan_files, referenced_data_file, resolve_selection,
+};
 use crate::iceberg::prune::Pruner;
 use crate::iceberg::request::{Request, selection};
 use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Table, Transform, Type};
@@ -42,9 +45,25 @@ async fn load_table(host: &Host, request: &Request) -> IcebergResult<(Storage, T
     }
 
     let bytes = storage.get(location).await?;
-    let table = Table::parse(&bytes)
-        .map_err(|e| err_invalid_data(format!("{location}: {}", e.message())))?;
+    let table = decompress_metadata(&bytes)
+        .and_then(|bytes| Table::parse(&bytes))
+        .map_err(|e| with_context(e, location))?;
     Ok((storage, table))
+}
+
+/// Table metadata may be gzip-compressed (`*.gz.metadata.json`, `write.metadata.compression-codec`
+/// = `gzip`); detected by the gzip magic bytes, as Java and PyIceberg do.
+fn decompress_metadata(bytes: &[u8]) -> IcebergResult<Cow<'_, [u8]>> {
+    use std::io::Read;
+
+    if !bytes.starts_with(&[0x1F, 0x8B]) {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    let mut out = Vec::with_capacity(bytes.len() * 8);
+    flate2::read::MultiGzDecoder::new(bytes)
+        .read_to_end(&mut out)
+        .map_err(|e| err_invalid_data(format!("gzip-compressed table metadata: {e}")))?;
+    Ok(Cow::Owned(out))
 }
 
 pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
@@ -125,9 +144,6 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
     let mut total_deleted_rows: u64 = 0;
     let mut num_position_delete_files = 0;
     let mut num_deletion_vectors = 0;
-    // A position delete file may apply to several data files (partition-scoped), but its rows
-    // are counted once.
-    let mut counted_position_deletes: PlHashSet<&str> = PlHashSet::default();
 
     for task in &tasks {
         let file = &task.file;
@@ -139,18 +155,27 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         }
 
         let mut position_deletes = vec![];
-        let mut position_delete_files = vec![];
+        let mut position_delete_rows: u64 = 0;
         let mut deletion_vector = None;
         let mut deletion_vector_rows: u64 = 0;
 
         for delete in &task.deletes {
             match delete.file_format.as_str() {
                 "PARQUET" => {
+                    // Polars reads position delete files of one data file only. This also keeps
+                    // the deleted row count exact: the rows of a delete file scoped to a
+                    // partition may belong to data files that are no longer live.
+                    if referenced_data_file(delete).is_none() {
+                        return Err(err_not_implemented(format!(
+                            "position delete file not limited to one data file ({})",
+                            delete.file_path
+                        )));
+                    }
                     position_deletes.push(DeleteRef {
                         kind: DeleteKind::Position,
                         path: normalize_path(&delete.file_path),
                     });
-                    position_delete_files.push(delete);
+                    position_delete_rows += delete.record_count as u64;
                 },
                 "PUFFIN" => {
                     if deletion_vector.is_some() {
@@ -182,11 +207,7 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                 vec![dv]
             },
             None => {
-                for delete in position_delete_files {
-                    if counted_position_deletes.insert(delete.file_path.as_str()) {
-                        total_deleted_rows += delete.record_count as u64;
-                    }
-                }
+                total_deleted_rows += position_delete_rows;
                 num_position_delete_files += position_deletes.len();
                 position_deletes
             },
@@ -428,5 +449,36 @@ fn datum_to_bytes(d: &Datum, ty: &Type) -> Vec<u8> {
         Datum::Double(v) => v.to_le_bytes().to_vec(),
         Datum::String(s) => s.as_bytes().to_vec(),
         Datum::Bytes(b) => b.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use polars_io_ext_ffi::common::FfiErrorKind;
+
+    use super::*;
+    use crate::iceberg::error::err_not_implemented;
+
+    #[test]
+    fn gzip_metadata_is_decompressed() {
+        let json = br#"{"format-version": 2}"#;
+        assert_eq!(&*decompress_metadata(json).unwrap(), json);
+
+        let mut encoder = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+        encoder.write_all(json).unwrap();
+        let gz = encoder.finish().unwrap();
+        assert_eq!(&*decompress_metadata(&gz).unwrap(), json);
+    }
+
+    #[test]
+    fn context_keeps_error_kind() {
+        let err = with_context(err_not_implemented("Avro codec 'bzip2'"), "manifest m.avro");
+        assert_eq!(err.kind(), FfiErrorKind::NOT_IMPLEMENTED);
+        assert_eq!(
+            err.message(),
+            "iceberg: manifest m.avro: unsupported: Avro codec 'bzip2'"
+        );
     }
 }

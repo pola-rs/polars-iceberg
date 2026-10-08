@@ -241,10 +241,87 @@ fn project_predicate(p: &Predicate, idx: usize, transform: &Transform) -> Bound 
                 None => Bound::True,
             }
         },
-        // Bucket values could be computed for `Eq` / `In` (murmur3); not implemented, so no
-        // pruning.
-        Transform::Bucket(_) | Transform::Void | Transform::Other(_) => Bound::True,
+        Transform::Bucket(n) => {
+            let b = |l: &Lit| bucket(*n, &p.ty, l).map(Lit::Int);
+            let (op, lits) = match p.op {
+                Op::Eq => (Op::Eq, apply_all(&b)),
+                Op::In => (
+                    Op::In,
+                    apply_all(&b).map(|mut lits| {
+                        lits.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+                        lits.dedup();
+                        lits
+                    }),
+                ),
+                _ => return Bound::True,
+            };
+            match lits {
+                Some(lits) => with(op, lits, PrimitiveType::Int),
+                None => Bound::True,
+            }
+        },
+        Transform::Void | Transform::Other(_) => Bound::True,
     }
+}
+
+/// The bucket of a value, as defined by the Iceberg spec (32-bit Murmur3 hash, seed 0, of the
+/// value's bucket serialization); `None` for types this does not handle.
+fn bucket(n: u32, ty: &PrimitiveType, lit: &Lit) -> Option<i64> {
+    use PrimitiveType as P;
+    if n == 0 {
+        return None;
+    }
+    let hash = match (ty, lit) {
+        // Ints are hashed as longs, so a column promoted from int to long keeps its buckets.
+        (P::Int | P::Long | P::Date | P::Time | P::Timestamp | P::Timestamptz, Lit::Int(v)) => {
+            murmur3_32(&v.to_le_bytes())
+        },
+        (P::Decimal { .. }, Lit::Decimal(v)) => murmur3_32(minimal_be_bytes(*v).as_slice()),
+        (P::String, Lit::Str(s)) => murmur3_32(s.as_bytes()),
+        (P::Uuid | P::Binary | P::Fixed(_), Lit::Bytes(b)) => murmur3_32(b),
+        _ => return None,
+    };
+    Some(i64::from((hash & i32::MAX as u32) % n))
+}
+
+/// Minimal big-endian two's-complement bytes of an unscaled decimal (Java's
+/// `BigInteger.toByteArray`).
+fn minimal_be_bytes(v: i128) -> Vec<u8> {
+    let be = v.to_be_bytes();
+    let redundant = be
+        .windows(2)
+        .take_while(|w| (w[0] == 0x00 && w[1] & 0x80 == 0) || (w[0] == 0xFF && w[1] & 0x80 != 0))
+        .count();
+    be[redundant..].to_vec()
+}
+
+/// MurmurHash3 x86 32-bit, seed 0.
+fn murmur3_32(data: &[u8]) -> u32 {
+    const C1: u32 = 0xcc9e_2d51;
+    const C2: u32 = 0x1b87_3593;
+    let mix = |k: u32| k.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
+
+    let mut h: u32 = 0;
+    let mut chunks = data.chunks_exact(4);
+    for chunk in &mut chunks {
+        h ^= mix(u32::from_le_bytes(chunk.try_into().unwrap()));
+        h = h.rotate_left(13).wrapping_mul(5).wrapping_add(0xe654_6b64);
+    }
+    let tail = chunks.remainder();
+    if !tail.is_empty() {
+        let mut k: u32 = 0;
+        for (i, b) in tail.iter().enumerate() {
+            k |= u32::from(*b) << (8 * i);
+        }
+        h ^= mix(k);
+    }
+
+    h ^= data.len() as u32;
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^ (h >> 16)
 }
 
 fn temporal(transform: &Transform, ty: &PrimitiveType, lit: &Lit) -> Option<Lit> {
@@ -544,6 +621,81 @@ mod tests {
         // Non-negative values are exact.
         let bound = project_one(Op::Eq, ts, vec![Lit::Int(0)], Transform::Day);
         assert_eq!(pred(&bound), (Op::Eq, vec![Lit::Int(0)]));
+    }
+
+    #[test]
+    fn bucket_hashes_match_spec() {
+        // Test vectors from the Iceberg spec, "Appendix B: 32-bit Hash Requirements".
+        let hash = |ty: PrimitiveType, lit: Lit| -> i32 {
+            match (&ty, &lit) {
+                (_, Lit::Int(v)) => murmur3_32(&v.to_le_bytes()) as i32,
+                (_, Lit::Decimal(v)) => murmur3_32(&minimal_be_bytes(*v)) as i32,
+                (_, Lit::Str(s)) => murmur3_32(s.as_bytes()) as i32,
+                (_, Lit::Bytes(b)) => murmur3_32(b) as i32,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(hash(PrimitiveType::Int, Lit::Int(34)), 2017239379);
+        assert_eq!(hash(PrimitiveType::Date, Lit::Int(17486)), -653330422);
+        assert_eq!(
+            hash(PrimitiveType::Time, Lit::Int(81_068_000_000)),
+            -662762989
+        );
+        assert_eq!(
+            hash(PrimitiveType::Timestamp, Lit::Int(1_510_871_468_000_000)),
+            -2047944441
+        );
+        let dec = PrimitiveType::Decimal {
+            precision: 9,
+            scale: 2,
+        };
+        assert_eq!(hash(dec, Lit::Decimal(1420)), -500754589);
+        assert_eq!(
+            hash(PrimitiveType::String, Lit::Str("iceberg".into())),
+            1210000089
+        );
+        let uuid = hex::decode("f79c3e09677c4bbda4793f349cb785e7").unwrap();
+        assert_eq!(hash(PrimitiveType::Uuid, Lit::Bytes(uuid)), 1488055340);
+        assert_eq!(
+            hash(PrimitiveType::Binary, Lit::Bytes(vec![0, 1, 2, 3])),
+            -188683207
+        );
+
+        // Negative decimals use the minimal two's complement.
+        assert_eq!(minimal_be_bytes(-1), vec![0xFF]);
+        assert_eq!(minimal_be_bytes(128), vec![0x00, 0x80]);
+        assert_eq!(minimal_be_bytes(-129), vec![0xFF, 0x7F]);
+    }
+
+    #[test]
+    fn bucket_projection() {
+        let bound = project_one(
+            Op::Eq,
+            PrimitiveType::Long,
+            vec![Lit::Int(34)],
+            Transform::Bucket(16),
+        );
+        assert_eq!(
+            pred(&bound),
+            (Op::Eq, vec![Lit::Int(i64::from(2017239379 % 16))])
+        );
+
+        let bound = project_one(
+            Op::In,
+            PrimitiveType::Long,
+            vec![Lit::Int(34), Lit::Int(34)],
+            Transform::Bucket(16),
+        );
+        assert_eq!(pred(&bound).1.len(), 1);
+
+        // Range predicates cannot be projected onto buckets.
+        let bound = project_one(
+            Op::Lt,
+            PrimitiveType::Long,
+            vec![Lit::Int(34)],
+            Transform::Bucket(16),
+        );
+        assert!(matches!(bound, Bound::True));
     }
 
     #[test]

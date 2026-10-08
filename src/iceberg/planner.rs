@@ -12,7 +12,7 @@ use polars_utils::aliases::{PlHashMap, PlHashSet};
 
 use crate::iceberg::avro::Datum;
 use crate::iceberg::error::{
-    IcebergResult, err_invalid_data, err_invalid_input, err_not_implemented,
+    IcebergResult, err_invalid_data, err_invalid_input, err_not_implemented, with_context,
 };
 use crate::iceberg::host::Storage;
 use crate::iceberg::manifest::{
@@ -21,7 +21,9 @@ use crate::iceberg::manifest::{
     parse_manifest, parse_manifest_list,
 };
 use crate::iceberg::prune::Pruner;
-use crate::iceberg::spec::{Schema, Snapshot, Table};
+use crate::iceberg::spec::{
+    PartitionSpec, PrimitiveType, Schema, Snapshot, Table, Transform, Type,
+};
 
 /// Maximum number of manifests fetched and decoded concurrently.
 const MANIFEST_CONCURRENCY: usize = 64;
@@ -207,8 +209,7 @@ async fn read_manifest_list(
         ));
     };
     let bytes = storage.get(path).await?;
-    parse_manifest_list(&bytes)
-        .map_err(|e| err_invalid_data(format!("manifest list {path}: {}", e.message())))
+    parse_manifest_list(&bytes).map_err(|e| with_context(e, format_args!("manifest list {path}")))
 }
 
 struct EntryView {
@@ -280,7 +281,7 @@ async fn plan_manifests(
             let path = manifest.path.clone();
             let decoded = crate::iceberg::runtime::spawn(async move {
                 parse_manifest(&bytes, &stats_field_ids)
-                    .map_err(|e| err_invalid_data(format!("manifest {path}: {}", e.message())))
+                    .map_err(|e| with_context(e, format_args!("manifest {path}")))
             })
             .await
             .map_err(|e| err_invalid_data(format!("manifest decode task failed: {e}")))??;
@@ -299,6 +300,7 @@ async fn plan_manifests(
             err_invalid_data(format!("partition spec {} not found", manifest.spec_id))
         })?;
         let partition_order = partition_order(&decoded.partition_field_ids, spec);
+        let decimal_fields = decimal_partition_fields(table, spec);
 
         for mut entry in decoded.entries {
             // Inheritance from the manifest list (`_inherit_from_manifest`).
@@ -320,7 +322,16 @@ async fn plan_manifests(
             let mut file = entry.file;
             file.partition = partition_order
                 .iter()
-                .map(|i| i.and_then(|i| file.partition.get(i).cloned().flatten()))
+                .zip(&decimal_fields)
+                .map(|(i, is_decimal)| {
+                    let value = i.and_then(|i| file.partition.get(i).cloned().flatten());
+                    match value {
+                        Some(Datum::Bytes(b)) if *is_decimal => {
+                            Some(Datum::Bytes(minimal_twos_complement(&b).to_vec()))
+                        },
+                        v => v,
+                    }
+                })
                 .collect();
             let sequence_number = entry.sequence_number.unwrap_or(0);
 
@@ -373,10 +384,7 @@ async fn plan_manifests(
 
 /// For each field of `spec`, the index of its value in the decoded partition tuple. Matches by
 /// field ID when the writer recorded them, otherwise by position.
-fn partition_order(
-    decoded_field_ids: &[Option<i32>],
-    spec: &crate::iceberg::spec::PartitionSpec,
-) -> Vec<Option<usize>> {
+fn partition_order(decoded_field_ids: &[Option<i32>], spec: &PartitionSpec) -> Vec<Option<usize>> {
     let by_id = decoded_field_ids.iter().all(|id| id.is_some()) && !decoded_field_ids.is_empty();
     spec.fields
         .iter()
@@ -391,6 +399,35 @@ fn partition_order(
             }
         })
         .collect()
+}
+
+/// For each field of `spec`, whether its values are decimals.
+fn decimal_partition_fields(table: &Table, spec: &PartitionSpec) -> Vec<bool> {
+    spec.fields
+        .iter()
+        .map(|field| {
+            matches!(
+                field.transform,
+                Transform::Identity | Transform::Truncate(_)
+            ) && table.schemas.values().any(|schema| {
+                schema.field_by_id(field.source_id).is_some_and(|f| {
+                    matches!(f.field_type, Type::Primitive(PrimitiveType::Decimal { .. }))
+                })
+            })
+        })
+        .collect()
+}
+
+/// Strip redundant sign-extension bytes from a big-endian two's-complement integer. Decimal
+/// partition values are Avro `fixed` sized by the precision, so widening the precision (e.g.
+/// `decimal(9, 2)` → `decimal(10, 2)`) changes the encoding of equal values: data and delete
+/// files written before and after must still match by partition.
+fn minimal_twos_complement(be: &[u8]) -> &[u8] {
+    let redundant = be
+        .windows(2)
+        .take_while(|w| (w[0] == 0x00 && w[1] & 0x80 == 0) || (w[0] == 0xFF && w[1] & 0x80 != 0))
+        .count();
+    &be[redundant..]
 }
 
 /// Position delete files (including deletion vectors) indexed by partition and by referenced
@@ -484,7 +521,7 @@ fn partition_key(partition: &[Option<Datum>]) -> String {
 }
 
 /// The data file a delete file applies to, if it is limited to one.
-fn referenced_data_file(file: &DataFile) -> Option<String> {
+pub fn referenced_data_file(file: &DataFile) -> Option<String> {
     if let Some(path) = &file.referenced_data_file {
         return Some(path.clone());
     }
@@ -505,4 +542,29 @@ fn applies_to_data_file(delete: &DataFile, data_path: &str) -> bool {
     };
     let path = data_path.as_bytes();
     lower <= path && path <= upper
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decimal_partition_keys_ignore_precision_width() {
+        // 1.00 as `decimal(9, 2)` (4 bytes) and `decimal(10, 2)` (5 bytes).
+        let narrow = [0x00, 0x00, 0x00, 0x64];
+        let wide = [0x00, 0x00, 0x00, 0x00, 0x64];
+        assert_eq!(minimal_twos_complement(&narrow), [0x64]);
+        assert_eq!(minimal_twos_complement(&wide), [0x64]);
+
+        // -1.00
+        assert_eq!(minimal_twos_complement(&[0xFF, 0xFF, 0xFF, 0x9C]), [0x9C]);
+        assert_eq!(
+            minimal_twos_complement(&[0xFF, 0xFF, 0x00, 0x9C]),
+            [0xFF, 0x00, 0x9C]
+        );
+        // 128 needs a leading zero byte.
+        assert_eq!(minimal_twos_complement(&[0x00, 0x00, 0x80]), [0x00, 0x80]);
+        assert_eq!(minimal_twos_complement(&[0x00]), [0x00]);
+        assert_eq!(minimal_twos_complement(&[]), [] as [u8; 0]);
+    }
 }
