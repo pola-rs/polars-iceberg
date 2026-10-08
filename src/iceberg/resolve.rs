@@ -75,7 +75,8 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
     host.debug(&format!(
         "polars-iceberg: resolve(): snapshot ID: {:?}, from snapshot ID exclusive: {:?}, \
         to snapshot ID inclusive: {:?}, version key: {:?}, \
-        limit: {:?}, projection: {:?}, filter_columns: {:?}, use_metadata_statistics: {}",
+        limit: {:?}, projection: {:?}, filter_columns: {:?}, statistics_columns: {:?}, \
+        use_metadata_statistics: {}",
         selection.snapshot_id,
         selection.from_snapshot_id_exclusive,
         selection.to_snapshot_id_inclusive,
@@ -83,6 +84,7 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         query.limit,
         query.projection,
         query.filter_columns,
+        query.statistics_columns,
         request.use_metadata_statistics,
     ));
 
@@ -94,11 +96,23 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
     };
     let projected_schema = Schema::new(schema.schema_id, projected.into_iter().cloned().collect());
 
-    let stats_fields: Option<Vec<&NestedField>> = query
-        .filter_columns
-        .as_ref()
-        .filter(|_| request.use_metadata_statistics)
-        .map(|columns| schema.select(columns));
+    // Statistics of columns that are not filtered on are best effort.
+    let best_effort_columns: Vec<String> = query
+        .statistics_columns
+        .iter()
+        .flatten()
+        .filter(|c| !query.filter_columns.iter().flatten().any(|f| f == *c))
+        .cloned()
+        .collect();
+    let best_effort_fields = schema.select(&best_effort_columns);
+    let best_effort_ids: PlHashSet<i32> = best_effort_fields.iter().map(|f| f.id).collect();
+    let stats_fields: Option<Vec<&NestedField>> = (request.use_metadata_statistics
+        && (query.filter_columns.is_some() || !best_effort_fields.is_empty()))
+    .then(|| {
+        let mut fields = schema.select(query.filter_columns.as_deref().unwrap_or_default());
+        fields.extend(best_effort_fields);
+        fields
+    });
 
     // Filter column names refer to the scanned schema (the snapshot's schema when time
     // travelling), not the current one: a column may have been renamed since.
@@ -263,20 +277,30 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         }
     }
 
-    // Statistics of the filter columns.
+    // Statistics of the filter and statistics columns.
     if let Some(stats_fields) = &stats_fields {
         let mut stats = vec![];
         for field in stats_fields {
-            let constants = match partition_values.columns.get(&field.id) {
-                Some(Err(msg)) => {
-                    return Err(err_invalid_data(format!(
-                        "statistics load failure for filter column: {msg}"
-                    )));
-                },
-                Some(Ok(v)) => Some(v.as_slice()),
-                None => None,
+            let field_stats = match partition_values.columns.get(&field.id) {
+                Some(Err(msg)) => Err(err_invalid_data(format!(
+                    "statistics load failure for filter column: {msg}"
+                ))),
+                Some(Ok(v)) => column_statistics(&table, field, &tasks, Some(v.as_slice())),
+                None => column_statistics(&table, field, &tasks, None),
             };
-            stats.extend(column_statistics(&table, field, &tasks, constants)?);
+            match field_stats {
+                Ok(field_stats) => stats.extend(field_stats),
+                Err(e) if best_effort_ids.contains(&field.id) => {
+                    host.debug(&format!(
+                        "polars-iceberg: resolve(): statistics load failed for column {:?}: \
+                        {}",
+                        field.name,
+                        e.message()
+                    ));
+                    stats.extend(null_column_statistics(field, tasks.len()));
+                },
+                Err(e) => return Err(e),
+            }
         }
         files.stats = Some(stats);
     }
@@ -455,6 +479,20 @@ fn column_statistics(
         (format!("{name}_min"), min),
         (format!("{name}_max"), max),
     ])
+}
+
+/// Null `{name}_nc`, `{name}_min`, `{name}_max` for a column whose statistics cannot be loaded.
+fn null_column_statistics(field: &NestedField, n: usize) -> Vec<(String, Box<dyn Array>)> {
+    let name = &field.name;
+    let ty = &field.field_type;
+    vec![
+        (
+            format!("{name}_nc"),
+            new_null_array(null_count_dtype(ty), n),
+        ),
+        (format!("{name}_min"), new_null_array(value_dtype(ty), n)),
+        (format!("{name}_max"), new_null_array(value_dtype(ty), n)),
+    ]
 }
 
 /// Iceberg single-value binary serialization of a partition value.
