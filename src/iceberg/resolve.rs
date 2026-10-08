@@ -140,7 +140,8 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
     ));
 
     let mut files = FilesTable::default();
-    let mut total_physical_rows: u64 = 0;
+    // `None` if a file's record count is unknown.
+    let mut total_physical_rows: Option<u64> = Some(0);
     let mut total_deleted_rows: u64 = 0;
     let mut num_position_delete_files = 0;
     let mut num_deletion_vectors = 0;
@@ -178,6 +179,14 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                     position_delete_rows += delete.record_count as u64;
                 },
                 "PUFFIN" => {
+                    // A deletion vector must reference its data file (spec). Without it, it would
+                    // be associated with every data file of its partition.
+                    if referenced_data_file(delete).is_none() {
+                        return Err(err_not_implemented(format!(
+                            "deletion vector without referenced data file ({})",
+                            delete.file_path
+                        )));
+                    }
                     if deletion_vector.is_some() {
                         return Err(err_not_implemented(format!(
                             "multiple deletion vectors associated with one data file ({})",
@@ -213,10 +222,14 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
             },
         };
 
-        total_physical_rows += file.record_count as u64;
+        total_physical_rows = add_record_count(total_physical_rows, file.record_count);
         files.paths.push(normalize_path(&file.file_path));
         files.sizes.push(file.file_size_in_bytes as u64);
-        files.record_counts.push(file.record_count as u64);
+        // A negative (unknown) count becomes `u64::MAX`, which the host's `len` statistic
+        // turns into null.
+        files
+            .record_counts
+            .push(u64::try_from(file.record_count).unwrap_or(u64::MAX));
         files.deletes.push(deletes);
     }
 
@@ -268,9 +281,12 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         files.stats = Some(stats);
     }
 
-    let row_count = (request.use_metadata_statistics
-        && (request.fast_deletion_count || total_deleted_rows == 0))
-        .then_some((total_physical_rows, total_deleted_rows));
+    let row_count = total_physical_rows
+        .filter(|_| {
+            request.use_metadata_statistics
+                && (request.fast_deletion_count || total_deleted_rows == 0)
+        })
+        .map(|rows| (rows, total_deleted_rows));
 
     host.debug(&format!(
         "polars-iceberg: resolve(): native scan_parquet(): num_sources: {}, snapshot ID: {:?}, \
@@ -288,6 +304,12 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         constant_errors,
         initial_defaults,
     })
+}
+
+/// Adds a file's record count to a running total; `None` once a count is unknown (negative: some
+/// format v1 writers wrote -1) or the total overflows.
+fn add_record_count(total: Option<u64>, record_count: i64) -> Option<u64> {
+    total?.checked_add(u64::try_from(record_count).ok()?)
 }
 
 /// Identity-partition values of projected fields, one value per file. Mirrors
@@ -470,6 +492,15 @@ mod tests {
         encoder.write_all(json).unwrap();
         let gz = encoder.finish().unwrap();
         assert_eq!(&*decompress_metadata(&gz).unwrap(), json);
+    }
+
+    #[test]
+    fn unknown_record_count_has_no_total() {
+        assert_eq!(add_record_count(Some(10), 5), Some(15));
+        assert_eq!(add_record_count(Some(10), 0), Some(10));
+        assert_eq!(add_record_count(Some(10), -1), None);
+        assert_eq!(add_record_count(None, 5), None);
+        assert_eq!(add_record_count(Some(u64::MAX), 1), None);
     }
 
     #[test]

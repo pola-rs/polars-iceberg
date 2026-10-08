@@ -299,7 +299,8 @@ async fn plan_manifests(
         let spec = table.specs.get(&manifest.spec_id).ok_or_else(|| {
             err_invalid_data(format!("partition spec {} not found", manifest.spec_id))
         })?;
-        let partition_order = partition_order(&decoded.partition_field_ids, spec);
+        let partition_order = partition_order(&decoded.partition_field_ids, spec)
+            .map_err(|e| with_context(e, format_args!("manifest {}", manifest.path)))?;
         let decimal_fields = decimal_partition_fields(table, spec);
 
         for mut entry in decoded.entries {
@@ -324,7 +325,7 @@ async fn plan_manifests(
                 .iter()
                 .zip(&decimal_fields)
                 .map(|(i, is_decimal)| {
-                    let value = i.and_then(|i| file.partition.get(i).cloned().flatten());
+                    let value = file.partition.get(*i).cloned().flatten();
                     match value {
                         Some(Datum::Bytes(b)) if *is_decimal => {
                             Some(Datum::Bytes(minimal_twos_complement(&b).to_vec()))
@@ -383,20 +384,30 @@ async fn plan_manifests(
 }
 
 /// For each field of `spec`, the index of its value in the decoded partition tuple. Matches by
-/// field ID when the writer recorded them, otherwise by position.
-fn partition_order(decoded_field_ids: &[Option<i32>], spec: &PartitionSpec) -> Vec<Option<usize>> {
+/// field ID when the writer recorded them, otherwise by position. A spec field without a value in
+/// the tuple is refused: treating it as null would prune and fill in constants wrongly.
+fn partition_order(
+    decoded_field_ids: &[Option<i32>],
+    spec: &PartitionSpec,
+) -> IcebergResult<Vec<usize>> {
     let by_id = decoded_field_ids.iter().all(|id| id.is_some()) && !decoded_field_ids.is_empty();
     spec.fields
         .iter()
         .enumerate()
         .map(|(i, field)| {
-            if by_id {
+            let index = if by_id {
                 decoded_field_ids
                     .iter()
                     .position(|id| *id == Some(field.field_id))
             } else {
-                (i < decoded_field_ids.len() || decoded_field_ids.is_empty()).then_some(i)
-            }
+                (i < decoded_field_ids.len()).then_some(i)
+            };
+            index.ok_or_else(|| {
+                err_not_implemented(format!(
+                    "partition field {} not found in manifest partition tuple",
+                    field.field_id
+                ))
+            })
         })
         .collect()
 }
@@ -547,6 +558,7 @@ fn applies_to_data_file(delete: &DataFile, data_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iceberg::spec::PartitionField;
 
     #[test]
     fn decimal_partition_keys_ignore_precision_width() {
@@ -566,5 +578,31 @@ mod tests {
         assert_eq!(minimal_twos_complement(&[0x00, 0x00, 0x80]), [0x00, 0x80]);
         assert_eq!(minimal_twos_complement(&[0x00]), [0x00]);
         assert_eq!(minimal_twos_complement(&[]), [] as [u8; 0]);
+    }
+
+    #[test]
+    fn partition_order_refuses_missing_fields() {
+        let field = |field_id| PartitionField {
+            source_id: 1,
+            field_id,
+            transform: Transform::Identity,
+        };
+        let spec = PartitionSpec {
+            fields: vec![field(1000), field(1001)],
+        };
+
+        assert_eq!(
+            partition_order(&[Some(1001), Some(1000)], &spec).unwrap(),
+            [1, 0]
+        );
+        assert_eq!(partition_order(&[None, None], &spec).unwrap(), [0, 1]);
+        assert!(partition_order(&[Some(1000), Some(1002)], &spec).is_err());
+        assert!(partition_order(&[None], &spec).is_err());
+        assert!(partition_order(&[], &spec).is_err());
+        assert!(
+            partition_order(&[], &PartitionSpec { fields: vec![] })
+                .unwrap()
+                .is_empty()
+        );
     }
 }

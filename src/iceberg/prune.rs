@@ -362,7 +362,8 @@ fn temporal(transform: &Transform, ty: &PrimitiveType, lit: &Lit) -> Option<Lit>
 fn truncate(width: u32, lit: &Lit) -> Option<Lit> {
     let w = i64::from(width);
     match lit {
-        Lit::Int(v) if w > 0 => Some(Lit::Int(v - v.rem_euclid(w))),
+        // Values within `width` of `i64::MIN` have no truncated value: not projected.
+        Lit::Int(v) if w > 0 => v.checked_sub(v.rem_euclid(w)).map(Lit::Int),
         Lit::Str(s) => Some(Lit::Str(s.chars().take(width as usize).collect())),
         Lit::Bytes(b) => Some(Lit::Bytes(b.iter().take(width as usize).copied().collect())),
         _ => None,
@@ -719,6 +720,41 @@ mod tests {
             Transform::Bucket(16),
         );
         assert!(matches!(bound, Bound::True));
+    }
+
+    #[test]
+    fn truncate_projection_does_not_overflow() {
+        let bound = project_one(
+            Op::GtEq,
+            PrimitiveType::Long,
+            vec![Lit::Int(i64::MIN)],
+            Transform::Truncate(10),
+        );
+        assert!(matches!(bound, Bound::True));
+
+        let bound = project_one(
+            Op::In,
+            PrimitiveType::Long,
+            vec![Lit::Int(5), Lit::Int(i64::MIN + 1)],
+            Transform::Truncate(10),
+        );
+        assert!(matches!(bound, Bound::True));
+
+        // Values that fit are rounded toward negative infinity.
+        let bound = project_one(
+            Op::GtEq,
+            PrimitiveType::Long,
+            vec![Lit::Int(i64::MIN + 8)],
+            Transform::Truncate(10),
+        );
+        assert_eq!(pred(&bound), (Op::GtEq, vec![Lit::Int(i64::MIN + 8)]));
+        let bound = project_one(
+            Op::Eq,
+            PrimitiveType::Long,
+            vec![Lit::Int(-1)],
+            Transform::Truncate(10),
+        );
+        assert_eq!(pred(&bound), (Op::Eq, vec![Lit::Int(-10)]));
     }
 
     #[test]

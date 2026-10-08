@@ -82,7 +82,9 @@ impl AvroFile {
                 break;
             }
             if count < 0 {
-                count = -count;
+                count = count
+                    .checked_neg()
+                    .ok_or_else(|| err_invalid_data("invalid Avro map block count"))?;
                 read_long(&mut buf)?;
             }
             for _ in 0..count {
@@ -483,7 +485,9 @@ pub fn for_each_item(
             return Ok(());
         }
         if count < 0 {
-            count = -count;
+            count = count
+                .checked_neg()
+                .ok_or_else(|| err_invalid_data("invalid Avro block count"))?;
             read_long(buf)?;
         }
         for _ in 0..count {

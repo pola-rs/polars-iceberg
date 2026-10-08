@@ -206,7 +206,11 @@ fn read_field_summaries(schema: &Schema, buf: &mut &[u8]) -> IcebergResult<Vec<F
     let ids = record_field_ids(record, FIELD_SUMMARY_NAMES);
     let mut out = vec![];
     for_each_item(buf, |buf| {
-        let mut s = FieldSummary::default();
+        // `contains_null` is required: a writer without it says nothing about nulls.
+        let mut s = FieldSummary {
+            contains_null: true,
+            ..Default::default()
+        };
         for (field, id) in record.fields.iter().zip(&ids) {
             let schema = &field.schema;
             match *id {
