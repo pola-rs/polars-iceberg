@@ -80,8 +80,12 @@ impl Storage {
 
 /// PyIceberg on Windows uses `file://C:/` rather than `file:///C:/`.
 pub fn normalize_path(path: &str) -> String {
+    // `file://C:/x` (as written by PyIceberg on Windows) has the drive letter as its
+    // authority; other authorities (UNC hosts, `localhost`) are kept.
     match path.strip_prefix("file://") {
-        Some(rest) if !rest.starts_with('/') => format!("file:///{rest}"),
+        Some(rest) if matches!(rest.as_bytes(), [d, b':', ..] if d.is_ascii_alphabetic()) => {
+            format!("file:///{rest}")
+        },
         _ => path.to_owned(),
     }
 }
