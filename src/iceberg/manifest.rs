@@ -159,7 +159,7 @@ pub fn parse_manifest_list(bytes: &[u8]) -> IcebergResult<Vec<ManifestFile>> {
     let record = file.record()?;
     let ids = record_field_ids(record, MANIFEST_FILE_NAMES);
 
-    let mut out = Vec::with_capacity(file.num_objects());
+    let mut out = Vec::with_capacity(file.objects_capacity_hint());
     file.for_each_object(|buf| {
         let mut m = ManifestFile {
             path: String::new(),
@@ -333,7 +333,7 @@ pub fn parse_manifest(bytes: &[u8], stats_field_ids: &PlHashSet<i32>) -> Iceberg
         stats_field_ids,
     };
 
-    let mut entries = Vec::with_capacity(file.num_objects());
+    let mut entries = Vec::with_capacity(file.objects_capacity_hint());
     file.for_each_object(|buf| {
         let mut entry = ManifestEntry {
             status: STATUS_EXISTING,

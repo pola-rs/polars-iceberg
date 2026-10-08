@@ -52,7 +52,8 @@ impl Schema {
             Schema::Union(branches) => branches
                 .iter()
                 .find(|b| !matches!(b, Schema::Null))
-                .unwrap_or(&branches[0]),
+                .or(branches.first())
+                .unwrap_or(self),
             s => s,
         }
     }
@@ -157,6 +158,13 @@ impl AvroFile {
     pub fn num_objects(&self) -> usize {
         self.blocks.iter().map(|(n, _)| n).sum()
     }
+
+    /// [`Self::num_objects`] bounded by the decoded size, as a capacity hint that a corrupt
+    /// block count cannot inflate.
+    pub fn objects_capacity_hint(&self) -> usize {
+        let bytes: usize = self.blocks.iter().map(|(_, data)| data.len()).sum();
+        self.num_objects().min(bytes)
+    }
 }
 
 enum Codec {
@@ -207,6 +215,9 @@ impl SchemaParser {
     fn parse(&mut self, json: &JsonValue, namespace: Option<&str>) -> IcebergResult<Schema> {
         match json {
             JsonValue::String(name) => self.parse_named_or_primitive(name, namespace),
+            JsonValue::Array(branches) if branches.is_empty() => {
+                Err(err_invalid_data("empty Avro union"))
+            },
             JsonValue::Array(branches) => Ok(Schema::Union(
                 branches
                     .iter()
@@ -366,6 +377,10 @@ pub fn read_long(buf: &mut &[u8]) -> IcebergResult<i64> {
             return Err(err_invalid_data("unexpected end of Avro data"));
         };
         *buf = rest;
+        // The 10th byte holds bit 63 only.
+        if shift == 63 && byte & 0x7E != 0 {
+            return Err(err_invalid_data("invalid Avro varint"));
+        }
         value |= u64::from(byte & 0x7F) << shift;
         if byte & 0x80 == 0 {
             break;
@@ -587,6 +602,23 @@ mod tests {
         crc.update(data);
         block.extend_from_slice(&crc.sum().to_be_bytes());
         block
+    }
+
+    #[test]
+    fn overlong_varint_is_rejected() {
+        // i64::MIN zigzag-encodes to u64::MAX: nine 0xFF bytes, then 0x01.
+        let mut buf: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        assert_eq!(read_long(&mut buf).unwrap(), i64::MIN);
+
+        // Bits beyond 64 in the 10th byte.
+        let mut buf: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x03];
+        assert!(read_long(&mut buf).is_err());
+    }
+
+    #[test]
+    fn empty_union_is_rejected() {
+        let json: JsonValue = serde_json::from_str("[]").unwrap();
+        assert!(SchemaParser::default().parse(&json, None).is_err());
     }
 
     #[test]

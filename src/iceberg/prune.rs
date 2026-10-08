@@ -6,6 +6,9 @@
 //! value (`NaN > x` is true), whereas Iceberg evaluators treat comparisons with NaN as false. So
 //! greater-than predicates on float columns only prune when NaNs are known to be absent.
 //!
+//! Null semantics are Iceberg's: `NotEq`, `NotIn` and `NotStartsWith` match null values. Polars
+//! sends e.g. `~is_in(..., nulls_equal=True)` as `Not(In)`, which keeps null rows.
+//!
 //! Every function answers "might rows match?"; `true` keeps the manifest / file.
 use std::cmp::Ordering;
 
@@ -370,8 +373,8 @@ fn truncate(width: u32, lit: &Lit) -> Option<Lit> {
 
 fn value_might_match(p: &Predicate, value: Option<&Lit>) -> bool {
     let Some(value) = value else {
-        // Comparisons with null never hold.
-        return p.op == Op::IsNull;
+        // Comparisons with null never hold, but their negations do.
+        return matches!(p.op, Op::IsNull | Op::NotEq | Op::NotIn | Op::NotStartsWith);
     };
     if value.is_nan() {
         // NaN ordering differs between Iceberg and Polars; see the module docs.
@@ -506,7 +509,8 @@ fn predicate_metrics_might_match(p: &Predicate, file: &DataFile) -> bool {
         Op::NotNull => !nulls_only,
         Op::IsNan => is_float && !nulls_only && nan_count != Some(0),
         Op::NotNan => !nans_only,
-        Op::NotEq | Op::NotIn | Op::NotStartsWith => !nulls_only,
+        // These match nulls.
+        Op::NotEq | Op::NotIn | Op::NotStartsWith => true,
         _ => {
             if nulls_only {
                 return false;
@@ -595,6 +599,25 @@ mod tests {
             Bound::Pred(p) => (p.op, p.lits.clone()),
             other => panic!("expected a predicate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn negated_predicates_match_null_partition_values() {
+        let p = |op, lits| Predicate {
+            field_id: 1,
+            ty: PrimitiveType::Long,
+            op,
+            lits,
+        };
+        let one = || vec![Lit::Int(1)];
+        // E.g. `~is_in([1], nulls_equal=True)` keeps nulls.
+        assert!(value_might_match(&p(Op::NotIn, one()), None));
+        assert!(value_might_match(&p(Op::NotEq, one()), None));
+        assert!(value_might_match(&p(Op::IsNull, vec![]), None));
+        assert!(!value_might_match(&p(Op::In, one()), None));
+        assert!(!value_might_match(&p(Op::Eq, one()), None));
+        assert!(!value_might_match(&p(Op::Lt, one()), None));
+        assert!(!value_might_match(&p(Op::NotNull, vec![]), None));
     }
 
     // 1969-12-31T12:00:00 in microseconds: day -1.
