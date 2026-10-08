@@ -179,6 +179,14 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                     position_delete_rows += delete.record_count as u64;
                 },
                 "PUFFIN" => {
+                    // A deletion vector must reference its data file (spec). Without it, it would
+                    // be associated with every data file of its partition.
+                    if referenced_data_file(delete).is_none() {
+                        return Err(err_not_implemented(format!(
+                            "deletion vector without referenced data file ({})",
+                            delete.file_path
+                        )));
+                    }
                     if deletion_vector.is_some() {
                         return Err(err_not_implemented(format!(
                             "multiple deletion vectors associated with one data file ({})",
