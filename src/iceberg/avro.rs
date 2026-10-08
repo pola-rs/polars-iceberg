@@ -179,13 +179,19 @@ impl Codec {
                 Ok(out)
             },
             Codec::Snappy => {
-                // Snappy blocks are followed by a 4-byte CRC32 of the uncompressed data.
-                let data = data
-                    .get(..data.len().saturating_sub(4))
-                    .ok_or_else(|| err_invalid_data("truncated snappy Avro block"))?;
-                snap::raw::Decoder::new()
+                // Snappy blocks are followed by the big-endian CRC32 of the uncompressed data.
+                let Some((data, checksum)) = data.split_last_chunk::<4>() else {
+                    return Err(err_invalid_data("truncated snappy Avro block"));
+                };
+                let out = snap::raw::Decoder::new()
                     .decompress_vec(data)
-                    .map_err(|e| err_invalid_data(format!("Avro block decompression: {e}")))
+                    .map_err(|e| err_invalid_data(format!("Avro block decompression: {e}")))?;
+                let mut crc = flate2::Crc::new();
+                crc.update(&out);
+                if crc.sum() != u32::from_be_bytes(*checksum) {
+                    return Err(err_invalid_data("snappy Avro block checksum mismatch"));
+                }
+                Ok(out)
             },
             Codec::Zstd => zstd::stream::decode_all(data).map_err(err),
         }
@@ -569,4 +575,31 @@ pub fn read_datum(schema: &Schema, buf: &mut &[u8]) -> IcebergResult<Option<Datu
             )));
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snappy_block(data: &[u8]) -> Vec<u8> {
+        let mut block = snap::raw::Encoder::new().compress_vec(data).unwrap();
+        let mut crc = flate2::Crc::new();
+        crc.update(data);
+        block.extend_from_slice(&crc.sum().to_be_bytes());
+        block
+    }
+
+    #[test]
+    fn snappy_checksum_is_verified() {
+        let data = b"some manifest entries some manifest entries";
+        let block = snappy_block(data);
+        assert_eq!(Codec::Snappy.decompress(&block).unwrap(), data);
+
+        let mut corrupt = block.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let err = Codec::Snappy.decompress(&corrupt).unwrap_err();
+        assert!(err.message().contains("checksum mismatch"), "{err:?}");
+
+        assert!(Codec::Snappy.decompress(&block[..3]).is_err());
+    }
 }

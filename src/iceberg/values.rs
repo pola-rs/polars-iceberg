@@ -366,14 +366,19 @@ fn days_since_epoch(d: NaiveDate) -> i32 {
     d.num_days_from_ce() - UNIX_EPOCH_DAYS_FROM_CE
 }
 
-/// Parse a decimal string such as `-1.50` into an unscaled integer with the given scale.
-fn parse_decimal(s: &str, scale: u32) -> Option<i128> {
-    let (negative, digits) = match s.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, s.strip_prefix('+').unwrap_or(s)),
+/// Parse a decimal string such as `-1.50` or `1E-7` (as written by Python's `str(Decimal)`) into
+/// an unscaled integer with the given scale; `None` if it is not exactly representable at `scale`.
+pub fn parse_decimal(s: &str, scale: u32) -> Option<i128> {
+    let (mantissa, exponent) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], s[i + 1..].parse::<i32>().ok()?),
+        None => (s, 0),
     };
-    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
-    if frac_part.len() > scale as usize
+    let (negative, unsigned) = match mantissa.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, mantissa.strip_prefix('+').unwrap_or(mantissa)),
+    };
+    let (int_part, frac_part) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if int_part.is_empty() && frac_part.is_empty()
         || !int_part
             .chars()
             .chain(frac_part.chars())
@@ -381,17 +386,52 @@ fn parse_decimal(s: &str, scale: u32) -> Option<i128> {
     {
         return None;
     }
-    let mut value: i128 = if int_part.is_empty() {
-        0
+
+    // value = digits * 10^shift, at the target scale.
+    let digits = format!("{int_part}{frac_part}");
+    let shift = i64::from(scale) + i64::from(exponent) - frac_part.len() as i64;
+    let digits = digits.trim_start_matches('0');
+    let digits = if shift < 0 {
+        // Dropped digits must be zeros.
+        let drop = usize::try_from(-shift).ok()?;
+        let keep = digits.len().saturating_sub(drop);
+        if !digits[keep..].bytes().all(|b| b == b'0') {
+            return None;
+        }
+        &digits[..keep]
     } else {
-        int_part.parse().ok()?
+        digits
     };
-    for i in 0..scale as usize {
-        let digit = frac_part
-            .as_bytes()
-            .get(i)
-            .map_or(0, |b| i128::from(b - b'0'));
-        value = value.checked_mul(10)?.checked_add(digit)?;
+    if digits.is_empty() {
+        return Some(0);
     }
+    let value: i128 = digits.parse().ok()?;
+    let value = value.checked_mul(10_i128.checked_pow(u32::try_from(shift.max(0)).ok()?)?)?;
     Some(if negative { -value } else { value })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_decimal_strings() {
+        assert_eq!(parse_decimal("-1.50", 2), Some(-150));
+        assert_eq!(parse_decimal("1.500", 2), Some(150));
+        assert_eq!(parse_decimal("+3", 1), Some(30));
+        assert_eq!(parse_decimal(".5", 1), Some(5));
+        assert_eq!(parse_decimal("1.555", 2), None);
+        assert_eq!(parse_decimal("", 2), None);
+        assert_eq!(parse_decimal("1.x", 2), None);
+
+        // Exponent notation, as written by Python's `str(Decimal)`.
+        assert_eq!(parse_decimal("1E-7", 7), Some(1));
+        assert_eq!(parse_decimal("0E-7", 7), Some(0));
+        assert_eq!(parse_decimal("-2.5E-6", 7), Some(-25));
+        assert_eq!(parse_decimal("1.5e+2", 0), Some(150));
+        assert_eq!(parse_decimal("1E+2", 2), Some(10000));
+        assert_eq!(parse_decimal("1E-8", 7), None);
+        assert_eq!(parse_decimal("1E", 7), None);
+        assert_eq!(parse_decimal("1E99", 2), None);
+    }
 }
