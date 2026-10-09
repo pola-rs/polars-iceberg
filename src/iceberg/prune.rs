@@ -17,6 +17,8 @@ use polars_utils::aliases::PlHashMap;
 use crate::iceberg::avro::Datum;
 use crate::iceberg::expr::{Bound, Lit, Op, Predicate};
 use crate::iceberg::manifest::{DataFile, FieldSummary, ManifestFile};
+#[cfg(test)]
+use crate::iceberg::spec::PartitionField;
 use crate::iceberg::spec::{PartitionSpec, PrimitiveType, Schema, Transform, Type};
 
 const MICROS_PER_HOUR: i64 = 3_600_000_000;
@@ -80,7 +82,14 @@ impl Pruner {
             let Some(ty) = partition_type(spec, p.field_id as usize, schema) else {
                 return true;
             };
-            summary_might_match(p, summary, &ty)
+            let wrapped = [&summary.lower_bound, &summary.upper_bound]
+                .iter()
+                .any(|b| {
+                    b.as_deref()
+                        .and_then(|b| decode_bound(b, &ty))
+                        .is_some_and(|v| is_wrapped_truncate(spec, p.field_id as usize, &v))
+                });
+            wrapped || summary_might_match(p, summary, &ty)
         })
     }
 
@@ -105,6 +114,7 @@ impl Pruner {
                         let value = match value {
                             None => None,
                             Some(d) => match datum_to_lit(d, &ty) {
+                                Some(v) if is_wrapped_truncate(spec, idx, &v) => return true,
                                 Some(v) => Some(v),
                                 None => return true,
                             },
@@ -138,6 +148,19 @@ fn partition_type(spec: &PartitionSpec, idx: usize, schema: &Schema) -> Option<P
         | Transform::Hour
         | Transform::Bucket(_) => Some(PrimitiveType::Int),
         Transform::Void | Transform::Other(_) => None,
+    }
+}
+
+/// Whether a partition value of a `truncate` field is not a truncated value. Writers (Java,
+/// PyIceberg) truncate integers within the width of the type's minimum with a wrapping
+/// subtraction, giving a large positive value. Adding 2^32 or 2^64 to a multiple of the width
+/// never gives one when the subtraction wraps, so these values are not multiples of the width.
+fn is_wrapped_truncate(spec: &PartitionSpec, idx: usize, value: &Lit) -> bool {
+    match (spec.fields.get(idx).map(|f| &f.transform), value) {
+        (Some(Transform::Truncate(width)), Lit::Int(v)) if *width > 0 => {
+            v.rem_euclid(i64::from(*width)) != 0
+        },
+        _ => false,
     }
 }
 
@@ -778,6 +801,33 @@ mod tests {
             Transform::Truncate(10),
         );
         assert_eq!(pred(&bound), (Op::Eq, vec![Lit::Int(-10)]));
+    }
+
+    #[test]
+    fn wrapped_truncate_partition_values() {
+        let spec = |transform| PartitionSpec {
+            fields: vec![PartitionField {
+                source_id: 1,
+                field_id: 1000,
+                transform,
+            }],
+        };
+        let truncate = spec(Transform::Truncate(10));
+        // `truncate[10]` of `i64::MIN` / `i32::MIN` as written by Java and PyIceberg.
+        for v in [
+            i64::MIN.wrapping_sub(i64::MIN.rem_euclid(10)),
+            i64::from(i32::MIN.wrapping_sub(i32::MIN.rem_euclid(10))),
+        ] {
+            assert!(v > 0);
+            assert!(is_wrapped_truncate(&truncate, 0, &Lit::Int(v)));
+        }
+        assert!(!is_wrapped_truncate(&truncate, 0, &Lit::Int(-10)));
+        assert!(!is_wrapped_truncate(&truncate, 0, &Lit::Int(0)));
+        assert!(!is_wrapped_truncate(
+            &spec(Transform::Identity),
+            0,
+            &Lit::Int(7)
+        ));
     }
 
     #[test]
