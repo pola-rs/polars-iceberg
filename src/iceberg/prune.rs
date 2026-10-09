@@ -419,18 +419,13 @@ fn summary_might_match(p: &Predicate, s: &FieldSummary, ty: &PrimitiveType) -> b
     let lower = s.lower_bound.as_deref().and_then(|b| decode_bound(b, ty));
     let upper = s.upper_bound.as_deref().and_then(|b| decode_bound(b, ty));
 
+    // Absent bounds are unknown: the spec makes them optional, so they do not imply that all
+    // values are null (as Java and PyIceberg assume).
     match p.op {
         Op::IsNull => s.contains_null,
-        Op::NotNull => !(s.contains_null && s.lower_bound.is_none() && !may_have_nan),
         Op::IsNan => may_have_nan,
-        Op::NotNan | Op::NotEq | Op::NotIn | Op::NotStartsWith => true,
-        _ => {
-            if s.lower_bound.is_none() && s.upper_bound.is_none() {
-                // All values are null (and NaN, for floats).
-                return may_have_nan && matches!(p.op, Op::Gt | Op::GtEq);
-            }
-            bounds_might_match(p, lower.as_ref(), upper.as_ref(), may_have_nan)
-        },
+        Op::NotNull | Op::NotNan | Op::NotEq | Op::NotIn | Op::NotStartsWith => true,
+        _ => bounds_might_match(p, lower.as_ref(), upper.as_ref(), may_have_nan),
     }
 }
 
@@ -619,6 +614,34 @@ mod tests {
         assert!(!value_might_match(&p(Op::Eq, one()), None));
         assert!(!value_might_match(&p(Op::Lt, one()), None));
         assert!(!value_might_match(&p(Op::NotNull, vec![]), None));
+    }
+
+    #[test]
+    fn absent_summary_bounds_are_unknown() {
+        let p = |op, lits| Predicate {
+            field_id: 1,
+            ty: PrimitiveType::Long,
+            op,
+            lits,
+        };
+        let summary = |contains_null| FieldSummary {
+            contains_null,
+            contains_nan: None,
+            lower_bound: None,
+            upper_bound: None,
+        };
+        let ty = PrimitiveType::Long;
+        for contains_null in [false, true] {
+            let s = summary(contains_null);
+            assert!(summary_might_match(&p(Op::Eq, vec![Lit::Int(2)]), &s, &ty));
+            assert!(summary_might_match(&p(Op::Lt, vec![Lit::Int(2)]), &s, &ty));
+            assert!(summary_might_match(&p(Op::In, vec![Lit::Int(2)]), &s, &ty));
+            assert!(summary_might_match(&p(Op::NotNull, vec![]), &s, &ty));
+            assert_eq!(
+                summary_might_match(&p(Op::IsNull, vec![]), &s, &ty),
+                contains_null
+            );
+        }
     }
 
     // 1969-12-31T12:00:00 in microseconds: day -1.

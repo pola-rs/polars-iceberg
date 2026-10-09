@@ -8,6 +8,7 @@ use serde_json::Value as JsonValue;
 use crate::iceberg::error::{
     IcebergResult, err_invalid_data, err_invalid_input, err_not_implemented,
 };
+use crate::iceberg::json;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -88,8 +89,7 @@ pub struct Table {
 
 impl Table {
     pub fn parse(bytes: &[u8]) -> IcebergResult<Self> {
-        let mut metadata: TableMetadata = serde_json::from_slice(bytes)
-            .map_err(|e| err_invalid_data(format!("invalid table metadata JSON: {e}")))?;
+        let mut metadata: TableMetadata = json::from_slice(bytes, "table metadata JSON")?;
 
         if metadata.format_version > 3 {
             return Err(err_not_implemented(format!(

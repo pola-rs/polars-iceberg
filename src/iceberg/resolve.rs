@@ -12,6 +12,7 @@ use crate::iceberg::avro::Datum;
 use crate::iceberg::error::{IcebergResult, err_invalid_data, err_not_implemented, with_context};
 use crate::iceberg::expr::bind;
 use crate::iceberg::host::{Host, Storage, normalize_path};
+use crate::iceberg::json;
 use crate::iceberg::output::{DeleteKind, DeleteRef, FilesTable, Resolved};
 use crate::iceberg::planner::{
     FileTask, PlanOptions, plan_files, referenced_data_file, resolve_selection,
@@ -120,9 +121,8 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
     let row_filter = query
         .row_filter
         .as_deref()
-        .map(serde_json::from_str::<serde_json::Value>)
-        .transpose()
-        .map_err(|e| err_invalid_data(format!("invalid row_filter JSON: {e}")))?;
+        .map(|s| json::from_slice::<serde_json::Value>(s.as_bytes(), "row_filter JSON"))
+        .transpose()?;
     let pruner = row_filter.as_ref().map(|json| {
         let bound = bind(json, &pruner_schema);
         host.debug(&format!(
