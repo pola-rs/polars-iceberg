@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::time::Instant;
 
 use polars_arrow::array::{Array, PrimitiveArray, new_null_array};
+use polars_arrow::compute::concatenate::concatenate;
 use polars_utils::aliases::{PlHashMap, PlHashSet};
 
 use crate::iceberg::arrow_types::{null_count_dtype, table_fields, value_dtype};
@@ -251,6 +252,17 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         files.deletes.push(deletes);
     }
 
+    // `initial-default` values of all projected fields, including nested ones.
+    let mut initial_defaults = vec![];
+    let mut default_ids: Vec<i32> = projected_schema.field_ids().collect();
+    default_ids.sort_unstable();
+    for id in default_ids {
+        let field = projected_schema.field_by_id(id).unwrap();
+        if let Some(json) = &field.initial_default {
+            initial_defaults.push((id, initial_default_array(&field.field_type, json)?));
+        }
+    }
+
     // Identity-partition constants of the projected fields.
     let partition_values = PartitionValues::build(&table, &projected_schema, &tasks);
 
@@ -260,24 +272,26 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
             Ok(datums) => {
                 let ty = &projected_schema.field_by_id(*field_id).unwrap().field_type;
                 let refs: Vec<Option<&Datum>> = datums.iter().map(Option::as_ref).collect();
-                match partition_values_array(ty, &refs) {
+                let array = partition_values_array(ty, &refs).and_then(|array| {
+                    // A null value of a spec with the identity field is a null; files of specs
+                    // without it take the `initial-default` (the host only falls back to it for
+                    // sources past the end of the constants).
+                    match initial_defaults.iter().find(|(id, _)| id == field_id) {
+                        Some((_, default)) => fill_absent(
+                            array,
+                            default.as_ref(),
+                            &partition_values.present[field_id],
+                        ),
+                        None => Ok(array),
+                    }
+                });
+                match array {
                     Ok(array) => files.constants.push((*field_id, array)),
                     Err(e) => constant_errors
                         .push((*field_id, format!("failed to load partition values: {e}"))),
                 }
             },
             Err(msg) => constant_errors.push((*field_id, msg.clone())),
-        }
-    }
-
-    // `initial-default` values of all projected fields, including nested ones.
-    let mut initial_defaults = vec![];
-    let mut default_ids: Vec<i32> = projected_schema.field_ids().collect();
-    default_ids.sort_unstable();
-    for id in default_ids {
-        let field = projected_schema.field_by_id(id).unwrap();
-        if let Some(json) = &field.initial_default {
-            initial_defaults.push((id, initial_default_array(&field.field_type, json)?));
         }
     }
 
@@ -345,6 +359,8 @@ fn add_record_count(total: Option<u64>, record_count: i64) -> Option<u64> {
 struct PartitionValues {
     /// Source field ID → per-file values, or the reason they cannot be used.
     columns: PlHashMap<i32, Result<Vec<Option<Datum>>, String>>,
+    /// Source field ID → per-file: whether the file's partition spec has the identity field.
+    present: PlHashMap<i32, Vec<bool>>,
 }
 
 impl PartitionValues {
@@ -389,6 +405,8 @@ impl PartitionValues {
         }
 
         let n = tasks.len();
+        let mut present: PlHashMap<i32, Vec<bool>> =
+            columns.keys().map(|id| (*id, vec![false; n])).collect();
         for (i, task) in tasks.iter().enumerate() {
             let Some(fields) = identity_fields.get(&task.spec_id) else {
                 for column in columns.values_mut() {
@@ -397,6 +415,7 @@ impl PartitionValues {
                 continue;
             };
             for (index, source_id) in fields {
+                present.get_mut(source_id).unwrap()[i] = true;
                 if let Some(Ok(values)) = columns.get_mut(source_id) {
                     values.resize(i, None);
                     values.push(task.partition.get(*index).cloned().flatten());
@@ -408,8 +427,36 @@ impl PartitionValues {
             values.resize(n, None);
         }
 
-        Self { columns }
+        Self { columns, present }
     }
+}
+
+/// `values` with the entries where `present` is false replaced by `default` (length 1).
+fn fill_absent(
+    values: Box<dyn Array>,
+    default: &dyn Array,
+    present: &[bool],
+) -> Result<Box<dyn Array>, String> {
+    if present.iter().all(|p| *p) {
+        return Ok(values);
+    }
+    let mut parts: Vec<Box<dyn Array>> = vec![];
+    let mut start = 0;
+    while start < present.len() {
+        let is_present = present[start];
+        let end = present[start..]
+            .iter()
+            .position(|p| *p != is_present)
+            .map_or(present.len(), |len| start + len);
+        if is_present {
+            parts.push(values.sliced(start, end - start));
+        } else {
+            parts.extend((start..end).map(|_| default.to_boxed()));
+        }
+        start = end;
+    }
+    let refs: Vec<&dyn Array> = parts.iter().map(|a| a.as_ref()).collect();
+    concatenate(&refs).map_err(|e| e.to_string())
 }
 
 /// `{name}_nc`, `{name}_min`, `{name}_max` for one filter column. Mirrors
