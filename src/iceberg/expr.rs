@@ -217,7 +217,7 @@ fn bind_predicate(
     op: Op,
     schema: &Schema,
 ) -> Option<Bound> {
-    let field = resolve_term(obj.get("term")?, schema)?;
+    let (field, required) = resolve_term(obj.get("term")?, schema)?;
     let Type::Primitive(pt) = &field.field_type else {
         return None;
     };
@@ -227,8 +227,8 @@ fn bind_predicate(
     match op {
         Op::IsNan if !is_float => return Some(Bound::False),
         Op::NotNan if !is_float => return Some(Bound::True),
-        Op::IsNull if field.required => return Some(Bound::False),
-        Op::NotNull if field.required => return Some(Bound::True),
+        Op::IsNull if required => return Some(Bound::False),
+        Op::NotNull if required => return Some(Bound::True),
         _ => {},
     }
 
@@ -290,8 +290,9 @@ fn literal_range(v: &JsonValue, ty: &PrimitiveType) -> Option<(Lit, Lit)> {
     Some((lit.clone(), lit))
 }
 
-/// A term is a (possibly dotted) column name, or `{"type": "reference", "term": name}`.
-fn resolve_term<'a>(term: &JsonValue, schema: &'a Schema) -> Option<&'a NestedField> {
+/// A term is a (possibly dotted) column name, or `{"type": "reference", "term": name}`. Also
+/// returns whether the field is never null: it and all its parent structs are required.
+fn resolve_term<'a>(term: &JsonValue, schema: &'a Schema) -> Option<(&'a NestedField, bool)> {
     let name = match term {
         JsonValue::String(s) => s.as_str(),
         JsonValue::Object(obj) if obj.get("type").and_then(|t| t.as_str()) == Some("reference") => {
@@ -301,12 +302,14 @@ fn resolve_term<'a>(term: &JsonValue, schema: &'a Schema) -> Option<&'a NestedFi
     };
 
     let mut fields = &schema.fields;
+    let mut required = true;
     let mut parts = name.split('.').peekable();
     loop {
         let part = parts.next()?;
         let field = fields.iter().find(|f| f.name == part)?;
+        required &= field.required;
         if parts.peek().is_none() {
-            return Some(field);
+            return Some((field, required));
         }
         match &field.field_type {
             Type::Struct(children) => fields = children,
@@ -406,6 +409,32 @@ mod tests {
             Bound::Pred(p) => (p.op, &p.lits),
             other => panic!("expected a predicate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn null_checks_on_required_field_of_optional_struct_are_kept() {
+        let leaf = NestedField {
+            id: 2,
+            name: "x".into(),
+            required: true,
+            field_type: Type::Primitive(PrimitiveType::Long),
+            initial_default: None,
+        };
+        let schema = Schema::new(
+            0,
+            vec![NestedField {
+                id: 1,
+                name: "s".into(),
+                required: false,
+                field_type: Type::Struct(vec![leaf]),
+                initial_default: None,
+            }],
+        );
+        // `s.x` is null where `s` is.
+        let bound = bind(&json!({"type": "is-null", "term": "s.x"}), &schema);
+        assert_eq!(pred(&bound).0, Op::IsNull);
+        let bound = bind(&json!({"type": "not-null", "term": "s.x"}), &schema);
+        assert_eq!(pred(&bound).0, Op::NotNull);
     }
 
     // 2020-01-01T00:00:00.000001 in nanoseconds.

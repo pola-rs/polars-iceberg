@@ -133,7 +133,8 @@ pub fn decimal_from_be_bytes(be: &[u8], precision: u32) -> IcebergResult<i128> {
 }
 
 /// Whether a field's type change across schemas still allows identity partition values to be
-/// used. Mirrors `IdentityTransformedPartitionValuesBuilder`.
+/// used. Mirrors `IdentityTransformedPartitionValuesBuilder`, and also allows decimal precision
+/// widening (unscaled values are unchanged).
 pub fn partition_type_change_allowed(projected: &Type, other: &Type) -> bool {
     use PrimitiveType as P;
     projected == other
@@ -144,6 +145,13 @@ pub fn partition_type_change_allowed(projected: &Type, other: &Type) -> bool {
                     Type::Primitive(P::Double | P::Float),
                     Type::Primitive(P::Double | P::Float)
                 )
+        )
+        || matches!(
+            (projected, other),
+            (
+                Type::Primitive(P::Decimal { precision: p1, scale: s1 }),
+                Type::Primitive(P::Decimal { precision: p2, scale: s2 }),
+            ) if s1 == s2 && p1 >= p2
         )
 }
 
