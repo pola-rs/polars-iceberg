@@ -523,16 +523,13 @@ fn parse_primitive(s: &str) -> IcebergResult<PrimitiveType> {
                 let (p, sc) = args
                     .split_once(',')
                     .ok_or_else(|| err_invalid_data(format!("invalid type '{s}'")))?;
-                P::Decimal {
-                    precision: p
-                        .trim()
-                        .parse()
-                        .map_err(|_| err_invalid_data(format!("invalid type '{s}'")))?,
-                    scale: sc
-                        .trim()
-                        .parse()
-                        .map_err(|_| err_invalid_data(format!("invalid type '{s}'")))?,
+                let invalid = || err_invalid_data(format!("invalid type '{s}'"));
+                let precision: u32 = p.trim().parse().map_err(|_| invalid())?;
+                let scale: u32 = sc.trim().parse().map_err(|_| invalid())?;
+                if precision > 38 {
+                    return Err(invalid());
                 }
+                P::Decimal { precision, scale }
             } else if let Some(n) = s.strip_prefix("fixed[").and_then(|r| r.strip_suffix(']')) {
                 P::Fixed(
                     n.trim()

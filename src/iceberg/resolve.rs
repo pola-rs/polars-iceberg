@@ -55,16 +55,16 @@ async fn load_table(host: &Host, request: &Request) -> IcebergResult<(Storage, T
 /// Table metadata may be gzip-compressed (`*.gz.metadata.json`, `write.metadata.compression-codec`
 /// = `gzip`); detected by the gzip magic bytes, as Java and PyIceberg do.
 fn decompress_metadata(bytes: &[u8]) -> IcebergResult<Cow<'_, [u8]>> {
-    use std::io::Read;
-
     if !bytes.starts_with(&[0x1F, 0x8B]) {
         return Ok(Cow::Borrowed(bytes));
     }
-    let mut out = Vec::with_capacity(bytes.len() * 8);
-    flate2::read::MultiGzDecoder::new(bytes)
-        .read_to_end(&mut out)
-        .map_err(|e| err_invalid_data(format!("gzip-compressed table metadata: {e}")))?;
-    Ok(Cow::Owned(out))
+    crate::iceberg::avro::read_to_end_limited(
+        flate2::read::MultiGzDecoder::new(bytes),
+        bytes.len() * 8,
+        crate::iceberg::avro::MAX_DECOMPRESSED_BYTES,
+        "gzip-compressed table metadata",
+    )
+    .map(Cow::Owned)
 }
 
 pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
@@ -190,7 +190,8 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                         kind: DeleteKind::Position,
                         path: normalize_path(&delete.file_path),
                     });
-                    position_delete_rows += delete.record_count as u64;
+                    position_delete_rows = position_delete_rows
+                        .saturating_add(non_negative(delete.record_count, "record_count")?);
                 },
                 "PUFFIN" => {
                     // A deletion vector must reference its data file (spec). Without it, it would
@@ -211,7 +212,8 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                         kind: DeleteKind::DeletionVector,
                         path: normalize_path(&delete.file_path),
                     });
-                    deletion_vector_rows += delete.record_count as u64;
+                    deletion_vector_rows = deletion_vector_rows
+                        .saturating_add(non_negative(delete.record_count, "record_count")?);
                 },
                 other => {
                     return Err(err_not_implemented(format!(
@@ -225,12 +227,12 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
         // A deletion vector supersedes position delete files for the same data file.
         let deletes = match deletion_vector {
             Some(dv) => {
-                total_deleted_rows += deletion_vector_rows;
+                total_deleted_rows = total_deleted_rows.saturating_add(deletion_vector_rows);
                 num_deletion_vectors += 1;
                 vec![dv]
             },
             None => {
-                total_deleted_rows += position_delete_rows;
+                total_deleted_rows = total_deleted_rows.saturating_add(position_delete_rows);
                 num_position_delete_files += position_deletes.len();
                 position_deletes
             },
@@ -238,7 +240,9 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
 
         total_physical_rows = add_record_count(total_physical_rows, file.record_count);
         files.paths.push(normalize_path(&file.file_path));
-        files.sizes.push(file.file_size_in_bytes as u64);
+        files
+            .sizes
+            .push(non_negative(file.file_size_in_bytes, "file_size_in_bytes")?);
         // A negative (unknown) count becomes `u64::MAX`, which the host's `len` statistic
         // turns into null.
         files
@@ -426,7 +430,11 @@ fn column_statistics(
         PrimitiveArray::<u64>::from(
             tasks
                 .iter()
-                .map(|t| t.file.null_value_count(field.id).map(|v| v as u64))
+                .map(|t| {
+                    t.file
+                        .null_value_count(field.id)
+                        .and_then(|v| u64::try_from(v).ok())
+                })
                 .collect::<Vec<_>>(),
         )
         .boxed()
@@ -510,6 +518,10 @@ fn datum_to_bytes(d: &Datum, ty: &Type) -> Vec<u8> {
         Datum::String(s) => s.as_bytes().to_vec(),
         Datum::Bytes(b) => b.clone(),
     }
+}
+
+fn non_negative(v: i64, name: &str) -> IcebergResult<u64> {
+    u64::try_from(v).map_err(|_| err_invalid_data(format!("negative manifest {name}: {v}")))
 }
 
 #[cfg(test)]
