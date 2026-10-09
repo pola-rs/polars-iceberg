@@ -352,6 +352,9 @@ async fn plan_manifests(
                     }
                     data_files.push((manifest.spec_id, sequence_number, file))
                 },
+                // Empty delete files (and deletion vectors) delete nothing; PyIceberg also
+                // skips them.
+                CONTENT_POSITION_DELETES if file.record_count == 0 => {},
                 CONTENT_POSITION_DELETES => {
                     delete_index.add(manifest.spec_id, sequence_number, file)
                 },
