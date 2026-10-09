@@ -18,6 +18,7 @@ mod avro;
 mod error;
 mod expr;
 mod host;
+mod json;
 mod manifest;
 mod output;
 mod planner;

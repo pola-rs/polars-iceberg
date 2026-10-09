@@ -17,6 +17,8 @@ use polars_utils::aliases::PlHashMap;
 use crate::iceberg::avro::Datum;
 use crate::iceberg::expr::{Bound, Lit, Op, Predicate};
 use crate::iceberg::manifest::{DataFile, FieldSummary, ManifestFile};
+#[cfg(test)]
+use crate::iceberg::spec::PartitionField;
 use crate::iceberg::spec::{PartitionSpec, PrimitiveType, Schema, Transform, Type};
 
 const MICROS_PER_HOUR: i64 = 3_600_000_000;
@@ -80,7 +82,14 @@ impl Pruner {
             let Some(ty) = partition_type(spec, p.field_id as usize, schema) else {
                 return true;
             };
-            summary_might_match(p, summary, &ty)
+            let wrapped = [&summary.lower_bound, &summary.upper_bound]
+                .iter()
+                .any(|b| {
+                    b.as_deref()
+                        .and_then(|b| decode_bound(b, &ty))
+                        .is_some_and(|v| is_wrapped_truncate(spec, p.field_id as usize, &v))
+                });
+            wrapped || summary_might_match(p, summary, &ty)
         })
     }
 
@@ -105,6 +114,7 @@ impl Pruner {
                         let value = match value {
                             None => None,
                             Some(d) => match datum_to_lit(d, &ty) {
+                                Some(v) if is_wrapped_truncate(spec, idx, &v) => return true,
                                 Some(v) => Some(v),
                                 None => return true,
                             },
@@ -138,6 +148,19 @@ fn partition_type(spec: &PartitionSpec, idx: usize, schema: &Schema) -> Option<P
         | Transform::Hour
         | Transform::Bucket(_) => Some(PrimitiveType::Int),
         Transform::Void | Transform::Other(_) => None,
+    }
+}
+
+/// Whether a partition value of a `truncate` field is not a truncated value. Writers (Java,
+/// PyIceberg) truncate integers within the width of the type's minimum with a wrapping
+/// subtraction, giving a large positive value. Adding 2^32 or 2^64 to a multiple of the width
+/// never gives one when the subtraction wraps, so these values are not multiples of the width.
+fn is_wrapped_truncate(spec: &PartitionSpec, idx: usize, value: &Lit) -> bool {
+    match (spec.fields.get(idx).map(|f| &f.transform), value) {
+        (Some(Transform::Truncate(width)), Lit::Int(v)) if *width > 0 => {
+            v.rem_euclid(i64::from(*width)) != 0
+        },
+        _ => false,
     }
 }
 
@@ -419,18 +442,13 @@ fn summary_might_match(p: &Predicate, s: &FieldSummary, ty: &PrimitiveType) -> b
     let lower = s.lower_bound.as_deref().and_then(|b| decode_bound(b, ty));
     let upper = s.upper_bound.as_deref().and_then(|b| decode_bound(b, ty));
 
+    // Absent bounds are unknown: the spec makes them optional, so they do not imply that all
+    // values are null (as Java and PyIceberg assume).
     match p.op {
         Op::IsNull => s.contains_null,
-        Op::NotNull => !(s.contains_null && s.lower_bound.is_none() && !may_have_nan),
         Op::IsNan => may_have_nan,
-        Op::NotNan | Op::NotEq | Op::NotIn | Op::NotStartsWith => true,
-        _ => {
-            if s.lower_bound.is_none() && s.upper_bound.is_none() {
-                // All values are null (and NaN, for floats).
-                return may_have_nan && matches!(p.op, Op::Gt | Op::GtEq);
-            }
-            bounds_might_match(p, lower.as_ref(), upper.as_ref(), may_have_nan)
-        },
+        Op::NotNull | Op::NotNan | Op::NotEq | Op::NotIn | Op::NotStartsWith => true,
+        _ => bounds_might_match(p, lower.as_ref(), upper.as_ref(), may_have_nan),
     }
 }
 
@@ -621,6 +639,34 @@ mod tests {
         assert!(!value_might_match(&p(Op::NotNull, vec![]), None));
     }
 
+    #[test]
+    fn absent_summary_bounds_are_unknown() {
+        let p = |op, lits| Predicate {
+            field_id: 1,
+            ty: PrimitiveType::Long,
+            op,
+            lits,
+        };
+        let summary = |contains_null| FieldSummary {
+            contains_null,
+            contains_nan: None,
+            lower_bound: None,
+            upper_bound: None,
+        };
+        let ty = PrimitiveType::Long;
+        for contains_null in [false, true] {
+            let s = summary(contains_null);
+            assert!(summary_might_match(&p(Op::Eq, vec![Lit::Int(2)]), &s, &ty));
+            assert!(summary_might_match(&p(Op::Lt, vec![Lit::Int(2)]), &s, &ty));
+            assert!(summary_might_match(&p(Op::In, vec![Lit::Int(2)]), &s, &ty));
+            assert!(summary_might_match(&p(Op::NotNull, vec![]), &s, &ty));
+            assert_eq!(
+                summary_might_match(&p(Op::IsNull, vec![]), &s, &ty),
+                contains_null
+            );
+        }
+    }
+
     // 1969-12-31T12:00:00 in microseconds: day -1.
     const PRE_EPOCH_US: i64 = -12 * 3_600_000_000;
 
@@ -755,6 +801,33 @@ mod tests {
             Transform::Truncate(10),
         );
         assert_eq!(pred(&bound), (Op::Eq, vec![Lit::Int(-10)]));
+    }
+
+    #[test]
+    fn wrapped_truncate_partition_values() {
+        let spec = |transform| PartitionSpec {
+            fields: vec![PartitionField {
+                source_id: 1,
+                field_id: 1000,
+                transform,
+            }],
+        };
+        let truncate = spec(Transform::Truncate(10));
+        // `truncate[10]` of `i64::MIN` / `i32::MIN` as written by Java and PyIceberg.
+        for v in [
+            i64::MIN.wrapping_sub(i64::MIN.rem_euclid(10)),
+            i64::from(i32::MIN.wrapping_sub(i32::MIN.rem_euclid(10))),
+        ] {
+            assert!(v > 0);
+            assert!(is_wrapped_truncate(&truncate, 0, &Lit::Int(v)));
+        }
+        assert!(!is_wrapped_truncate(&truncate, 0, &Lit::Int(-10)));
+        assert!(!is_wrapped_truncate(&truncate, 0, &Lit::Int(0)));
+        assert!(!is_wrapped_truncate(
+            &spec(Transform::Identity),
+            0,
+            &Lit::Int(7)
+        ));
     }
 
     #[test]

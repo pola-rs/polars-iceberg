@@ -133,17 +133,28 @@ pub fn decimal_from_be_bytes(be: &[u8], precision: u32) -> IcebergResult<i128> {
 }
 
 /// Whether a field's type change across schemas still allows identity partition values to be
-/// used. Mirrors `IdentityTransformedPartitionValuesBuilder`.
+/// used. Mirrors `IdentityTransformedPartitionValuesBuilder`: promotions in either direction (a
+/// scan of an older snapshot projects the type from before later promotions), and decimal
+/// precision changes (unscaled values are unchanged).
 pub fn partition_type_change_allowed(projected: &Type, other: &Type) -> bool {
     use PrimitiveType as P;
     projected == other
         || matches!(
             (projected, other),
-            (Type::Primitive(P::Long), Type::Primitive(P::Int))
-                | (
-                    Type::Primitive(P::Double | P::Float),
-                    Type::Primitive(P::Double | P::Float)
-                )
+            (
+                Type::Primitive(P::Int | P::Long),
+                Type::Primitive(P::Int | P::Long)
+            ) | (
+                Type::Primitive(P::Double | P::Float),
+                Type::Primitive(P::Double | P::Float)
+            )
+        )
+        || matches!(
+            (projected, other),
+            (
+                Type::Primitive(P::Decimal { scale: s1, .. }),
+                Type::Primitive(P::Decimal { scale: s2, .. }),
+            ) if s1 == s2
         )
 }
 
@@ -188,8 +199,11 @@ pub fn partition_values_array(
         P::Int | P::Date => PrimitiveArray::<i32>::from(
             ints(&as_i64)?
                 .into_iter()
-                .map(|v| v.map(|v| v as i32))
-                .collect::<Vec<_>>(),
+                .map(|v| {
+                    v.map(|v| i32::try_from(v).map_err(|_| format!("{v} out of range for {p:?}")))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         )
         .to(dtype)
         .boxed(),

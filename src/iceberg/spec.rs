@@ -8,6 +8,7 @@ use serde_json::Value as JsonValue;
 use crate::iceberg::error::{
     IcebergResult, err_invalid_data, err_invalid_input, err_not_implemented,
 };
+use crate::iceberg::json;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -88,8 +89,7 @@ pub struct Table {
 
 impl Table {
     pub fn parse(bytes: &[u8]) -> IcebergResult<Self> {
-        let mut metadata: TableMetadata = serde_json::from_slice(bytes)
-            .map_err(|e| err_invalid_data(format!("invalid table metadata JSON: {e}")))?;
+        let mut metadata: TableMetadata = json::from_slice(bytes, "table metadata JSON")?;
 
         if metadata.format_version > 3 {
             return Err(err_not_implemented(format!(
@@ -523,16 +523,13 @@ fn parse_primitive(s: &str) -> IcebergResult<PrimitiveType> {
                 let (p, sc) = args
                     .split_once(',')
                     .ok_or_else(|| err_invalid_data(format!("invalid type '{s}'")))?;
-                P::Decimal {
-                    precision: p
-                        .trim()
-                        .parse()
-                        .map_err(|_| err_invalid_data(format!("invalid type '{s}'")))?,
-                    scale: sc
-                        .trim()
-                        .parse()
-                        .map_err(|_| err_invalid_data(format!("invalid type '{s}'")))?,
+                let invalid = || err_invalid_data(format!("invalid type '{s}'"));
+                let precision: u32 = p.trim().parse().map_err(|_| invalid())?;
+                let scale: u32 = sc.trim().parse().map_err(|_| invalid())?;
+                if precision > 38 {
+                    return Err(invalid());
                 }
+                P::Decimal { precision, scale }
             } else if let Some(n) = s.strip_prefix("fixed[").and_then(|r| r.strip_suffix(']')) {
                 P::Fixed(
                     n.trim()

@@ -158,6 +158,7 @@ pub fn parse_manifest_list(bytes: &[u8]) -> IcebergResult<Vec<ManifestFile>> {
     let file = AvroFile::parse(bytes)?;
     let record = file.record()?;
     let ids = record_field_ids(record, MANIFEST_FILE_NAMES);
+    require_fields(&ids, &[(MANIFEST_PATH, "manifest_path")], "manifest list")?;
 
     let mut out = Vec::with_capacity(file.objects_capacity_hint());
     file.for_each_object(|buf| {
@@ -197,8 +198,14 @@ pub fn parse_manifest_list(bytes: &[u8]) -> IcebergResult<Vec<ManifestFile>> {
 fn read_field_summaries(schema: &Schema, buf: &mut &[u8]) -> IcebergResult<Vec<FieldSummary>> {
     use field_id::*;
 
-    let Some(Schema::Array(items)) = avro::resolve(schema, buf)? else {
-        return Ok(vec![]);
+    let items = match avro::resolve(schema, buf)? {
+        None => return Ok(vec![]),
+        Some(Schema::Array(items)) => items,
+        Some(_) => {
+            return Err(err_invalid_data(
+                "manifest list: partitions is not an array",
+            ));
+        },
     };
     let Schema::Record(record) = items.non_null() else {
         return Err(err_invalid_data("manifest list: invalid partition summary"));
@@ -307,6 +314,7 @@ pub fn parse_manifest(bytes: &[u8], stats_field_ids: &PlHashSet<i32>) -> Iceberg
     let file = AvroFile::parse(bytes)?;
     let record = file.record()?;
     let entry_ids = record_field_ids(record, MANIFEST_ENTRY_NAMES);
+    require_fields(&entry_ids, &[(STATUS, "status")], "manifest")?;
 
     let data_file_record = record
         .fields
@@ -319,6 +327,11 @@ pub fn parse_manifest(bytes: &[u8], stats_field_ids: &PlHashSet<i32>) -> Iceberg
         })
         .ok_or_else(|| err_invalid_data("manifest without data_file record"))?;
     let data_file_ids = record_field_ids(data_file_record, DATA_FILE_NAMES);
+    require_fields(
+        &data_file_ids,
+        &[(FILE_PATH, "file_path"), (RECORD_COUNT, "record_count")],
+        "manifest data_file",
+    )?;
 
     let partition_field_ids = data_file_record
         .fields
@@ -355,7 +368,9 @@ pub fn parse_manifest(bytes: &[u8], stats_field_ids: &PlHashSet<i32>) -> Iceberg
                 SEQUENCE_NUMBER => entry.sequence_number = read_opt_long(s, buf)?,
                 FILE_SEQUENCE_NUMBER => entry.file_sequence_number = read_opt_long(s, buf)?,
                 DATA_FILE => {
-                    avro::resolve(s, buf)?;
+                    if avro::resolve(s, buf)?.is_none() {
+                        return Err(err_invalid_data("manifest: data_file is null"));
+                    }
                     entry.file = data_file.decode(buf)?;
                 },
                 _ => skip(s, buf)?,
@@ -397,14 +412,16 @@ impl DataFileDecoder<'_> {
                 FILE_FORMAT => {
                     f.file_format = req(read_opt_str(s, buf)?, "file_format")?.to_ascii_uppercase()
                 },
-                PARTITION => {
-                    if let Some(Schema::Record(r)) = avro::resolve(s, buf)? {
+                PARTITION => match avro::resolve(s, buf)? {
+                    None => {},
+                    Some(Schema::Record(r)) => {
                         f.partition = r
                             .fields
                             .iter()
                             .map(|pf| read_datum(&pf.schema, buf))
                             .collect::<IcebergResult<_>>()?;
-                    }
+                    },
+                    Some(_) => return Err(err_invalid_data("manifest: partition is not a record")),
                 },
                 RECORD_COUNT => f.record_count = req(read_opt_long(s, buf)?, "record_count")?,
                 FILE_SIZE_IN_BYTES => {
@@ -511,6 +528,13 @@ fn read_int_map(
         Some(other) => Err(err_invalid_data(format!(
             "manifest: unexpected map schema {other:?}"
         ))),
+    }
+}
+
+fn require_fields(ids: &[i32], required: &[(i32, &str)], what: &str) -> IcebergResult<()> {
+    match required.iter().find(|(id, _)| !ids.contains(id)) {
+        Some((_, name)) => Err(err_invalid_data(format!("{what} without field '{name}'"))),
+        None => Ok(()),
     }
 }
 
