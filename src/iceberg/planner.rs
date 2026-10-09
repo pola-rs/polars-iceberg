@@ -515,6 +515,13 @@ impl DeleteFileIndex {
             out.extend(deletes.filter_by_seq(sequence_number).cloned());
         }
 
+        // A delete file listed in several manifests applies once. Deletion vectors in one
+        // Puffin file differ by offset.
+        if out.len() > 1 {
+            let mut seen = PlHashSet::default();
+            out.retain(|d| seen.insert((d.file_path.clone(), d.content_offset)));
+        }
+
         out
     }
 }
@@ -578,6 +585,42 @@ mod tests {
         assert_eq!(minimal_twos_complement(&[0x00, 0x00, 0x80]), [0x00, 0x80]);
         assert_eq!(minimal_twos_complement(&[0x00]), [0x00]);
         assert_eq!(minimal_twos_complement(&[]), [] as [u8; 0]);
+    }
+
+    #[test]
+    fn duplicate_delete_files_apply_once() {
+        let delete = |path: &str, content_offset| DataFile {
+            content: 1,
+            file_path: path.into(),
+            content_offset,
+            ..Default::default()
+        };
+        let mut index = DeleteFileIndex::default();
+        index.add(0, 2, delete("d1.parquet", None));
+        index.add(0, 3, delete("d1.parquet", None));
+        index.add(0, 2, delete("d2.parquet", None));
+        index.add(0, 2, delete("dv.puffin", Some(4)));
+        index.add(0, 2, delete("dv.puffin", Some(40)));
+
+        let data_file = DataFile {
+            file_path: "data.parquet".into(),
+            ..Default::default()
+        };
+        let mut paths = index
+            .for_data_file(0, 1, &data_file)
+            .iter()
+            .map(|d| (d.file_path.clone(), d.content_offset))
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                ("d1.parquet".to_string(), None),
+                ("d2.parquet".to_string(), None),
+                ("dv.puffin".to_string(), Some(4)),
+                ("dv.puffin".to_string(), Some(40)),
+            ]
+        );
     }
 
     #[test]
