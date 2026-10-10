@@ -31,6 +31,7 @@ pub struct FilesTable {
     pub record_counts: Vec<u64>,
     pub deletes: Vec<Vec<DeleteRef>>,
     pub constants: Vec<(i32, Box<dyn Array>)>,
+    pub constants_present: Vec<(i32, Box<dyn Array>)>,
     /// `None` if statistics were not requested.
     pub stats: Option<Vec<(String, Box<dyn Array>)>>,
 }
@@ -174,6 +175,16 @@ impl FilesTable {
                 false,
             ));
             arrays.push(constants.boxed());
+        }
+
+        if !self.constants_present.is_empty() {
+            let present = keyed_struct(self.constants_present, n)?;
+            fields.push(Field::new(
+                "constants_present".into(),
+                present.dtype().clone(),
+                false,
+            ));
+            arrays.push(present.boxed());
         }
 
         if let Some(stats) = self.stats
