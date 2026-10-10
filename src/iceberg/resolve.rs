@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 use std::time::Instant;
 
-use polars_arrow::array::{Array, PrimitiveArray, new_null_array};
+use polars_arrow::array::{Array, BooleanArray, PrimitiveArray, new_null_array};
 use polars_arrow::compute::concatenate::concatenate;
 use polars_utils::aliases::{PlHashMap, PlHashSet};
 
@@ -265,6 +265,12 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
 
     // Identity-partition constants of the projected fields.
     let partition_values = PartitionValues::build(&table, &projected_schema, &tasks);
+
+    files.constants_present = partition_values
+        .present
+        .iter()
+        .map(|(id, present)| (*id, BooleanArray::from_slice(present).boxed()))
+        .collect();
 
     let mut constant_errors = vec![];
     for (field_id, values) in &partition_values.columns {
