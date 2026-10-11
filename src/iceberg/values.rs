@@ -4,6 +4,8 @@
 //!
 //! The rules follow the Python resolver (`polars.io.iceberg._utils`), so that both paths produce
 //! the same statistics and defaults.
+use std::borrow::Cow;
+
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use polars_arrow::array::{
     Array, BinaryViewArray, BooleanArray, PrimitiveArray, Utf8ViewArray, new_null_array,
@@ -261,8 +263,12 @@ pub fn partition_values_array(
                 .iter()
                 .map(|v| {
                     v.map(|d| match d {
-                        Datum::Bytes(b) => Ok(b.as_slice()),
-                        Datum::String(s) => Ok(s.as_bytes()),
+                        Datum::Bytes(b) => Ok(Cow::Borrowed(b.as_slice())),
+                        // A UUID in an Avro `string` is in its text form.
+                        Datum::String(s) if matches!(p, P::Uuid) => {
+                            parse_uuid(s).map(Cow::Owned).ok_or_else(|| mismatch(d))
+                        },
+                        Datum::String(s) => Ok(Cow::Borrowed(s.as_bytes())),
                         d => Err(mismatch(d)),
                     })
                     .transpose()
@@ -307,7 +313,8 @@ pub fn initial_default_array(ty: &Type, json: &JsonValue) -> IcebergResult<Box<d
     Ok(match p {
         P::Boolean => BooleanArray::from_slice([json.as_bool().ok_or_else(invalid)?]).boxed(),
         P::Int => {
-            PrimitiveArray::<i32>::from_slice([json.as_i64().ok_or_else(invalid)? as i32]).boxed()
+            let v = json.as_i64().ok_or_else(invalid)?;
+            PrimitiveArray::<i32>::from_slice([i32::try_from(v).map_err(|_| invalid())?]).boxed()
         },
         P::Long => PrimitiveArray::<i64>::from_slice([json.as_i64().ok_or_else(invalid)?]).boxed(),
         P::Float => {
@@ -353,12 +360,7 @@ pub fn initial_default_array(ty: &Type, json: &JsonValue) -> IcebergResult<Box<d
         },
         P::String => Utf8ViewArray::from_slice_values([as_str()?]).boxed(),
         P::Uuid => {
-            let hex_str: String = as_str()?.chars().filter(|c| *c != '-').collect();
-            let bytes = hex::decode(hex_str).map_err(|_| invalid())?;
-            if bytes.len() != 16 {
-                return Err(invalid());
-            }
-            BinaryViewArray::from_slice_values([bytes]).boxed()
+            BinaryViewArray::from_slice_values([parse_uuid(as_str()?).ok_or_else(invalid)?]).boxed()
         },
         P::Binary | P::Fixed(_) => {
             let bytes = hex::decode(as_str()?).map_err(|_| invalid())?;
@@ -373,6 +375,13 @@ pub fn initial_default_array(ty: &Type, json: &JsonValue) -> IcebergResult<Box<d
         },
         P::Unknown => new_null_array(dtype, 1),
     })
+}
+
+/// The 16 bytes of a UUID in its text form (hyphens optional).
+pub fn parse_uuid(s: &str) -> Option<Vec<u8>> {
+    let hex_str: String = s.chars().filter(|c| *c != '-').collect();
+    let bytes = hex::decode(hex_str).ok()?;
+    (bytes.len() == 16).then_some(bytes)
 }
 
 fn days_since_epoch(d: NaiveDate) -> i32 {
@@ -427,6 +436,35 @@ pub fn parse_decimal(s: &str, scale: u32) -> Option<i128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_encoded_uuid_partition_values_are_decoded() {
+        let bytes: Vec<u8> = (0..16).collect();
+        let text = Datum::String("00010203-0405-0607-0809-0a0b0c0d0e0f".into());
+        let raw = Datum::Bytes(bytes.clone());
+        let array = partition_values_array(
+            &Type::Primitive(PrimitiveType::Uuid),
+            &[Some(&text), Some(&raw), None],
+        )
+        .unwrap();
+        let array = array.as_any().downcast_ref::<BinaryViewArray>().unwrap();
+        assert_eq!(array.value(0), bytes.as_slice());
+        assert_eq!(array.value(1), bytes.as_slice());
+        assert!(array.is_null(2));
+
+        let invalid = Datum::String("not-a-uuid".into());
+        assert!(
+            partition_values_array(&Type::Primitive(PrimitiveType::Uuid), &[Some(&invalid)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn out_of_range_int_initial_default_is_rejected() {
+        let int = Type::Primitive(PrimitiveType::Int);
+        assert!(initial_default_array(&int, &serde_json::json!(i32::MAX)).is_ok());
+        assert!(initial_default_array(&int, &serde_json::json!(1_i64 << 32)).is_err());
+    }
 
     #[test]
     fn parse_decimal_strings() {

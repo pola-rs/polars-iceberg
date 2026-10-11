@@ -21,6 +21,7 @@ use crate::iceberg::manifest::{DataFile, FieldSummary, ManifestFile};
 #[cfg(test)]
 use crate::iceberg::spec::PartitionField;
 use crate::iceberg::spec::{PartitionSpec, PrimitiveType, Schema, Transform, Type};
+use crate::iceberg::values::parse_uuid;
 
 const MICROS_PER_HOUR: i64 = 3_600_000_000;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
@@ -647,6 +648,8 @@ fn datum_to_lit(d: &Datum, ty: &PrimitiveType) -> Option<Lit> {
         (Datum::String(s), P::String) => Lit::Str(s.clone()),
         (Datum::Bytes(b), P::Decimal { .. }) => decode_bound(b, ty)?,
         (Datum::Bytes(b), _) => Lit::Bytes(b.clone()),
+        // A UUID in an Avro `string` is in its text form.
+        (Datum::String(s), P::Uuid) => Lit::Bytes(parse_uuid(s)?),
         (Datum::String(s), _) => Lit::Bytes(s.as_bytes().to_vec()),
     })
 }
@@ -985,6 +988,19 @@ mod tests {
         // Without an int history, values near `i32::MAX` are not wrapped.
         let (pruner, spec, schema) = wrapped_truncate_pruner(&[Long], Op::LtEq, -5);
         assert!(!pruner.manifest_might_match(&long_bounds, &spec, &schema));
+    }
+
+    #[test]
+    fn string_encoded_uuid_partition_value_matches_literal() {
+        let bytes: Vec<u8> = (0..16).collect();
+        let text = Datum::String("00010203-0405-0607-0809-0a0b0c0d0e0f".into());
+        assert_eq!(
+            datum_to_lit(&text, &PrimitiveType::Uuid),
+            Some(Lit::Bytes(bytes))
+        );
+        // Unparseable values are unknown (the file is kept), not compared as text.
+        let invalid = Datum::String("not-a-uuid".into());
+        assert_eq!(datum_to_lit(&invalid, &PrimitiveType::Uuid), None);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::Value as JsonValue;
 
 use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
-use crate::iceberg::values::parse_decimal;
+use crate::iceberg::values::{parse_decimal, parse_uuid};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -363,6 +363,10 @@ pub fn convert_literal(v: &JsonValue, ty: &PrimitiveType) -> Option<Lit> {
         },
         (JsonValue::String(s), P::Time) => {
             let t = NaiveTime::parse_from_str(s, "%H:%M:%S%.f").ok()?;
+            // Flooring sub-microsecond digits would narrow e.g. `<`.
+            if t.nanosecond() % 1000 != 0 {
+                return None;
+            }
             Some(Lit::Int(
                 i64::from(t.num_seconds_from_midnight()) * 1_000_000
                     + i64::from(t.nanosecond()) / 1000,
@@ -373,6 +377,9 @@ pub fn convert_literal(v: &JsonValue, ty: &PrimitiveType) -> Option<Lit> {
             let ts = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
                 .ok()?
                 .and_utc();
+            if matches!(ty, P::Timestamp) && ts.timestamp_subsec_nanos() % 1000 != 0 {
+                return None;
+            }
             Some(Lit::Int(if matches!(ty, P::Timestamp) {
                 ts.timestamp_micros()
             } else {
@@ -383,6 +390,9 @@ pub fn convert_literal(v: &JsonValue, ty: &PrimitiveType) -> Option<Lit> {
             let ts = DateTime::parse_from_rfc3339(s)
                 .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%:z"))
                 .ok()?;
+            if matches!(ty, P::Timestamptz) && ts.timestamp_subsec_nanos() % 1000 != 0 {
+                return None;
+            }
             Some(Lit::Int(if matches!(ty, P::Timestamptz) {
                 ts.timestamp_micros()
             } else {
@@ -392,11 +402,7 @@ pub fn convert_literal(v: &JsonValue, ty: &PrimitiveType) -> Option<Lit> {
         (JsonValue::String(s), P::Decimal { scale, .. }) => {
             parse_decimal(s, *scale).map(Lit::Decimal)
         },
-        (JsonValue::String(s), P::Uuid) => {
-            let hex_str: String = s.chars().filter(|c| *c != '-').collect();
-            let bytes = hex::decode(hex_str).ok()?;
-            (bytes.len() == 16).then_some(Lit::Bytes(bytes))
-        },
+        (JsonValue::String(s), P::Uuid) => parse_uuid(s).map(Lit::Bytes),
         _ => None,
     }
 }
@@ -547,6 +553,43 @@ mod tests {
             pred(&bound),
             (Op::Eq, &[Lit::Int(1_577_836_800_000_001)][..])
         );
+    }
+
+    #[test]
+    fn sub_microsecond_literals_are_not_floored() {
+        let convert = |v: &str, ty| convert_literal(&json!(v), &ty);
+        assert_eq!(
+            convert("00:00:00.000001", PrimitiveType::Time),
+            Some(Lit::Int(1))
+        );
+        assert_eq!(convert("00:00:00.0000015", PrimitiveType::Time), None);
+        assert_eq!(
+            convert("1970-01-01T00:00:00.000001000", PrimitiveType::Timestamp),
+            Some(Lit::Int(1))
+        );
+        assert_eq!(
+            convert("1970-01-01T00:00:00.0000015", PrimitiveType::Timestamp),
+            None
+        );
+        assert_eq!(
+            convert(
+                "1970-01-01T00:00:00.0000015+00:00",
+                PrimitiveType::Timestamptz
+            ),
+            None
+        );
+        // Nanosecond columns keep the digits.
+        assert_eq!(
+            convert("1970-01-01T00:00:00.0000015", PrimitiveType::TimestampNs),
+            Some(Lit::Int(1500))
+        );
+
+        // `x < 1.5 us` must not become `x < 1 us`.
+        let bound = bind(
+            &json!({"type": "lt", "term": "ts_us", "value": "2020-01-01T00:00:00.0000015"}),
+            &schema(),
+        );
+        assert!(matches!(bound, Bound::True));
     }
 
     #[test]
