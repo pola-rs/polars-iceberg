@@ -130,7 +130,7 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
             "polars-iceberg: resolve(): bound row filter: {}",
             bound.redacted()
         ));
-        Pruner::new(bound, &table.specs)
+        Pruner::new(bound, &table.specs, &table.schemas)
     });
 
     let options = PlanOptions {
