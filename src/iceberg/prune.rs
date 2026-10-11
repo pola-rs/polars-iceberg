@@ -82,13 +82,15 @@ impl Pruner {
             let Some(ty) = partition_type(spec, p.field_id as usize, schema) else {
                 return true;
             };
+            let idx = p.field_id as usize;
+            let decode = |b: &Option<Vec<u8>>| b.as_deref().and_then(|b| decode_bound(b, &ty));
+            // Wrapped values sort above every truncated value, so they can lie strictly between
+            // the bounds; an upper bound in their range is enough to suspect one.
             let wrapped = [&summary.lower_bound, &summary.upper_bound]
-                .iter()
-                .any(|b| {
-                    b.as_deref()
-                        .and_then(|b| decode_bound(b, &ty))
-                        .is_some_and(|v| is_wrapped_truncate(spec, p.field_id as usize, &v))
-                });
+                .into_iter()
+                .any(|b| decode(b).is_some_and(|v| is_wrapped_truncate(spec, idx, &v)))
+                || decode(&summary.upper_bound)
+                    .is_some_and(|v| may_be_wrapped_truncate(spec, idx, &ty, &v));
             wrapped || summary_might_match(p, summary, &ty)
         })
     }
@@ -159,6 +161,28 @@ fn is_wrapped_truncate(spec: &PartitionSpec, idx: usize, value: &Lit) -> bool {
     match (spec.fields.get(idx).map(|f| &f.transform), value) {
         (Some(Transform::Truncate(width)), Lit::Int(v)) if *width > 0 => {
             v.rem_euclid(i64::from(*width)) != 0
+        },
+        _ => false,
+    }
+}
+
+/// Whether a partition value of a `truncate` field lies in the range of wrapped values: a
+/// wrapped value `v - (v mod w) + 2^n` (for `v` within `w` of the minimum) is above
+/// `MAX - w + 1`.
+fn may_be_wrapped_truncate(
+    spec: &PartitionSpec,
+    idx: usize,
+    ty: &PrimitiveType,
+    value: &Lit,
+) -> bool {
+    let max = match ty {
+        PrimitiveType::Int => i64::from(i32::MAX),
+        PrimitiveType::Long => i64::MAX,
+        _ => return false,
+    };
+    match (spec.fields.get(idx).map(|f| &f.transform), value) {
+        (Some(Transform::Truncate(width)), Lit::Int(v)) if *width > 0 => {
+            *v > max - i64::from(*width) + 1
         },
         _ => false,
     }
@@ -601,6 +625,8 @@ fn datum_to_lit(d: &Datum, ty: &PrimitiveType) -> Option<Lit> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn project_one(op: Op, ty: PrimitiveType, lits: Vec<Lit>, transform: Transform) -> Bound {
@@ -828,6 +854,55 @@ mod tests {
             0,
             &Lit::Int(7)
         ));
+    }
+
+    #[test]
+    fn manifest_with_wrapped_truncate_value_between_bounds_is_kept() {
+        use crate::iceberg::spec::NestedField;
+
+        let spec = Arc::new(PartitionSpec {
+            fields: vec![PartitionField {
+                source_id: 1,
+                field_id: 1000,
+                transform: Transform::Truncate(100),
+            }],
+        });
+        let schema = Schema::new(
+            0,
+            vec![NestedField {
+                id: 1,
+                name: "x".into(),
+                required: false,
+                field_type: Type::Primitive(PrimitiveType::Int),
+                initial_default: None,
+            }],
+        );
+        let x_lt_0 = Bound::Pred(Predicate {
+            field_id: 1,
+            ty: PrimitiveType::Int,
+            op: Op::Lt,
+            lits: vec![Lit::Int(0)],
+        });
+        let pruner = Pruner::new(x_lt_0, &PlHashMap::from_iter([(0, spec.clone())]));
+        let manifest = |lower: i32, upper: i32| ManifestFile {
+            path: String::new(),
+            length: 0,
+            spec_id: 0,
+            content: 0,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: None,
+            partitions: vec![FieldSummary {
+                contains_null: false,
+                contains_nan: None,
+                lower_bound: Some(lower.to_le_bytes().to_vec()),
+                upper_bound: Some(upper.to_le_bytes().to_vec()),
+            }],
+        };
+
+        // `truncate[100]` of `i32::MIN` wraps to 2147483596, between these bounds.
+        assert!(pruner.manifest_might_match(&manifest(2147483400, 2147483600), &spec, &schema));
+        assert!(!pruner.manifest_might_match(&manifest(100, 2147483500), &spec, &schema));
     }
 
     #[test]
