@@ -103,6 +103,22 @@ pub enum Bound {
 }
 
 impl Bound {
+    /// The filter's structure without its literals, which may be sensitive, for logging.
+    pub fn redacted(&self) -> String {
+        match self {
+            Bound::True => "true".into(),
+            Bound::False => "false".into(),
+            Bound::And(a, b) => format!("and({}, {})", a.redacted(), b.redacted()),
+            Bound::Or(a, b) => format!("or({}, {})", a.redacted(), b.redacted()),
+            Bound::Pred(p) => format!(
+                "{:?}(field {}, {} literal(s))",
+                p.op,
+                p.field_id,
+                p.lits.len()
+            ),
+        }
+    }
+
     pub fn and(a: Bound, b: Bound) -> Bound {
         match (a, b) {
             (Bound::False, _) | (_, Bound::False) => Bound::False,
@@ -227,7 +243,11 @@ fn bind_predicate(
     match op {
         Op::IsNan if !is_float => return Some(Bound::False),
         Op::NotNan if !is_float => return Some(Bound::True),
-        Op::IsNull if required => return Some(Bound::False),
+        // A required field added without an `initial-default` is null in older files (both
+        // Java and PyIceberg allow adding one), so only a default guarantees values.
+        Op::IsNull if required && field.initial_default.is_some() => {
+            return Some(Bound::False);
+        },
         Op::NotNull if required => return Some(Bound::True),
         _ => {},
     }
@@ -435,6 +455,40 @@ mod tests {
         assert_eq!(pred(&bound).0, Op::IsNull);
         let bound = bind(&json!({"type": "not-null", "term": "s.x"}), &schema);
         assert_eq!(pred(&bound).0, Op::NotNull);
+    }
+
+    #[test]
+    fn is_null_on_required_field_is_kept_without_initial_default() {
+        // A required field added without a default is null in older files.
+        let schema = |initial_default| {
+            Schema::new(
+                0,
+                vec![NestedField {
+                    id: 1,
+                    name: "r".into(),
+                    required: true,
+                    field_type: Type::Primitive(PrimitiveType::Long),
+                    initial_default,
+                }],
+            )
+        };
+        let is_null = json!({"type": "is-null", "term": "r"});
+        assert_eq!(pred(&bind(&is_null, &schema(None))).0, Op::IsNull);
+        assert!(matches!(
+            bind(&is_null, &schema(Some(json!(1)))),
+            Bound::False
+        ));
+    }
+
+    #[test]
+    fn redacted_filter_has_no_literals() {
+        let bound = bind(
+            &json!({"type": "eq", "term": "ts_us", "value": "2020-01-01T00:00:00.123456"}),
+            &schema(),
+        );
+        let text = bound.redacted();
+        assert!(!text.contains("123456") && !text.contains("2020"), "{text}");
+        assert!(text.contains("field 2"), "{text}");
     }
 
     // 2020-01-01T00:00:00.000001 in nanoseconds.

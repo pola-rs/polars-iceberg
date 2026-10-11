@@ -127,9 +127,10 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
     let pruner = row_filter.as_ref().map(|json| {
         let bound = bind(json, &pruner_schema);
         host.debug(&format!(
-            "polars-iceberg: resolve(): bound row filter: {bound:?}"
+            "polars-iceberg: resolve(): bound row filter: {}",
+            bound.redacted()
         ));
-        Pruner::new(bound, &table.specs)
+        Pruner::new(bound, &table.specs, &table.schemas)
     });
 
     let options = PlanOptions {
@@ -190,6 +191,7 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                     position_deletes.push(DeleteRef {
                         kind: DeleteKind::Position,
                         path: normalize_path(&delete.file_path),
+                        content_offset: None,
                     });
                     position_delete_rows = position_delete_rows
                         .saturating_add(non_negative(delete.record_count, "record_count")?);
@@ -212,6 +214,9 @@ pub async fn resolve(host: Host, request: &Request) -> IcebergResult<Resolved> {
                     deletion_vector = Some(DeleteRef {
                         kind: DeleteKind::DeletionVector,
                         path: normalize_path(&delete.file_path),
+                        // A Puffin file can hold several deletion vectors of one data file
+                        // (e.g. a live and a replaced one); the offset selects the blob.
+                        content_offset: delete.content_offset,
                     });
                     deletion_vector_rows = deletion_vector_rows
                         .saturating_add(non_negative(delete.record_count, "record_count")?);

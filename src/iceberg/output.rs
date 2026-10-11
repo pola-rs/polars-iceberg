@@ -38,6 +38,8 @@ pub struct FilesTable {
 pub struct DeleteRef {
     pub kind: DeleteKind,
     pub path: String,
+    /// Offset of the deletion vector blob in its Puffin file.
+    pub content_offset: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -121,6 +123,7 @@ impl FilesTable {
         let delete_dtype = ArrowDataType::Struct(vec![
             Field::new("kind".into(), ArrowDataType::Utf8View, false),
             Field::new("path".into(), ArrowDataType::Utf8View, false),
+            Field::new("content_offset".into(), ArrowDataType::Int64, true),
         ]);
 
         let mut fields = vec![
@@ -138,10 +141,12 @@ impl FilesTable {
         offsets.push(0i64);
         let mut kinds = vec![];
         let mut paths = vec![];
+        let mut content_offsets = vec![];
         for deletes in &self.deletes {
             for d in deletes {
                 kinds.push(d.kind.as_str());
                 paths.push(d.path.as_str());
+                content_offsets.push(d.content_offset);
             }
             offsets.push(kinds.len() as i64);
         }
@@ -151,6 +156,7 @@ impl FilesTable {
             vec![
                 Utf8ViewArray::from_slice_values(&kinds).boxed(),
                 Utf8ViewArray::from_slice_values(&paths).boxed(),
+                PrimitiveArray::<i64>::from(content_offsets).boxed(),
             ],
             None,
         )?;

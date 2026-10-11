@@ -11,6 +11,7 @@
 //!
 //! Every function answers "might rows match?"; `true` keeps the manifest / file.
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use polars_utils::aliases::PlHashMap;
 
@@ -33,10 +34,19 @@ pub struct Pruner {
 
 struct SpecProjection {
     filter: Bound,
+    /// Per partition field: the maximum values of the integer types its source has had in any
+    /// schema, for detecting wrapped `truncate` values (see [`may_be_wrapped_truncate`]).
+    int_maxes: Vec<Vec<i64>>,
 }
 
 impl Pruner {
-    pub fn new(filter: Bound, specs: &PlHashMap<i32, std::sync::Arc<PartitionSpec>>) -> Self {
+    /// `schemas`: all schemas of the table, whose type history decides which wrapped
+    /// `truncate` values manifests may hold.
+    pub fn new(
+        filter: Bound,
+        specs: &PlHashMap<i32, Arc<PartitionSpec>>,
+        schemas: &PlHashMap<i32, Arc<Schema>>,
+    ) -> Self {
         let projections = specs
             .iter()
             .map(|(id, spec)| {
@@ -44,6 +54,11 @@ impl Pruner {
                     *id,
                     SpecProjection {
                         filter: project(&filter, spec),
+                        int_maxes: spec
+                            .fields
+                            .iter()
+                            .map(|f| source_int_maxes(f.source_id, schemas))
+                            .collect(),
                     },
                 )
             })
@@ -82,12 +97,15 @@ impl Pruner {
             let Some(ty) = partition_type(spec, p.field_id as usize, schema) else {
                 return true;
             };
+            let idx = p.field_id as usize;
+            let decode = |b: &Option<Vec<u8>>| b.as_deref().and_then(|b| decode_bound(b, &ty));
+            // Wrapped values sort above every truncated value, so they can lie strictly between
+            // the bounds; an upper bound in their range is enough to suspect one.
             let wrapped = [&summary.lower_bound, &summary.upper_bound]
-                .iter()
-                .any(|b| {
-                    b.as_deref()
-                        .and_then(|b| decode_bound(b, &ty))
-                        .is_some_and(|v| is_wrapped_truncate(spec, p.field_id as usize, &v))
+                .into_iter()
+                .any(|b| decode(b).is_some_and(|v| is_wrapped_truncate(spec, idx, &v)))
+                || decode(&summary.upper_bound).is_some_and(|v| {
+                    may_be_wrapped_truncate(spec, idx, &projection.int_maxes[idx], &v)
                 });
             wrapped || summary_might_match(p, summary, &ty)
         })
@@ -162,6 +180,40 @@ fn is_wrapped_truncate(spec: &PartitionSpec, idx: usize, value: &Lit) -> bool {
         },
         _ => false,
     }
+}
+
+/// Whether a partition value of a `truncate` field lies in the range of wrapped values: a
+/// wrapped value `v - (v mod w) + 2^n` (for `v` within `w` of the minimum) is in
+/// `MAX - w + 2 ..= MAX`. Every integer type the source has had counts: after an int → long
+/// promotion, manifests written before it hold values wrapped within the int range.
+fn may_be_wrapped_truncate(
+    spec: &PartitionSpec,
+    idx: usize,
+    int_maxes: &[i64],
+    value: &Lit,
+) -> bool {
+    match (spec.fields.get(idx).map(|f| &f.transform), value) {
+        (Some(Transform::Truncate(width)), Lit::Int(v)) if *width > 0 => int_maxes
+            .iter()
+            .any(|max| *v > max - i64::from(*width) + 1 && v <= max),
+        _ => false,
+    }
+}
+
+/// Maximum values of the integer types a field has had across `schemas`.
+fn source_int_maxes(source_id: i32, schemas: &PlHashMap<i32, Arc<Schema>>) -> Vec<i64> {
+    let mut maxes = vec![];
+    for schema in schemas.values() {
+        let max = match schema.field_by_id(source_id).map(|f| &f.field_type) {
+            Some(Type::Primitive(PrimitiveType::Int)) => i64::from(i32::MAX),
+            Some(Type::Primitive(PrimitiveType::Long)) => i64::MAX,
+            _ => continue,
+        };
+        if !maxes.contains(&max) {
+            maxes.push(max);
+        }
+    }
+    maxes
 }
 
 // Inclusive projection.
@@ -601,6 +653,8 @@ fn datum_to_lit(d: &Datum, ty: &PrimitiveType) -> Option<Lit> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     fn project_one(op: Op, ty: PrimitiveType, lits: Vec<Lit>, transform: Transform) -> Bound {
@@ -828,6 +882,109 @@ mod tests {
             0,
             &Lit::Int(7)
         ));
+    }
+
+    /// A table with `x` partitioned by `truncate[100]`, with `x` of the given type in each schema
+    /// (the last one is scanned), and a manifest with partition summary bounds.
+    fn wrapped_truncate_pruner(
+        types: &[PrimitiveType],
+        op: Op,
+        lit: i64,
+    ) -> (Pruner, Arc<PartitionSpec>, Arc<Schema>) {
+        use crate::iceberg::spec::NestedField;
+
+        let spec = Arc::new(PartitionSpec {
+            fields: vec![PartitionField {
+                source_id: 1,
+                field_id: 1000,
+                transform: Transform::Truncate(100),
+            }],
+        });
+        let schemas: PlHashMap<i32, Arc<Schema>> = types
+            .iter()
+            .enumerate()
+            .map(|(id, ty)| {
+                let field = NestedField {
+                    id: 1,
+                    name: "x".into(),
+                    required: false,
+                    field_type: Type::Primitive(ty.clone()),
+                    initial_default: None,
+                };
+                (id as i32, Arc::new(Schema::new(id as i32, vec![field])))
+            })
+            .collect();
+        let filter = Bound::Pred(Predicate {
+            field_id: 1,
+            ty: types.last().unwrap().clone(),
+            op,
+            lits: vec![Lit::Int(lit)],
+        });
+        let pruner = Pruner::new(filter, &PlHashMap::from_iter([(0, spec.clone())]), &schemas);
+        let scanned = schemas[&(types.len() as i32 - 1)].clone();
+        (pruner, spec, scanned)
+    }
+
+    fn summary_manifest(lower: Vec<u8>, upper: Vec<u8>) -> ManifestFile {
+        ManifestFile {
+            path: String::new(),
+            length: 0,
+            spec_id: 0,
+            content: 0,
+            sequence_number: 0,
+            min_sequence_number: 0,
+            added_snapshot_id: None,
+            partitions: vec![FieldSummary {
+                contains_null: false,
+                contains_nan: None,
+                lower_bound: Some(lower),
+                upper_bound: Some(upper),
+            }],
+        }
+    }
+
+    #[test]
+    fn manifest_with_wrapped_truncate_value_between_bounds_is_kept() {
+        let (pruner, spec, schema) = wrapped_truncate_pruner(&[PrimitiveType::Int], Op::Lt, 0);
+        let manifest = |lower: i32, upper: i32| {
+            summary_manifest(lower.to_le_bytes().to_vec(), upper.to_le_bytes().to_vec())
+        };
+
+        // `truncate[100]` of `i32::MIN` wraps to 2147483596, between these bounds.
+        assert!(pruner.manifest_might_match(&manifest(2147483400, 2147483600), &spec, &schema));
+        assert!(!pruner.manifest_might_match(&manifest(100, 2147483500), &spec, &schema));
+    }
+
+    #[test]
+    fn wrapped_int_truncate_value_is_kept_after_promotion_to_long() {
+        use PrimitiveType::{Int, Long};
+
+        // `x <= -5` on a column promoted from int to long. Manifests written before the
+        // promotion hold `truncate[100]` of `i32::MIN` wrapped to 2147483596.
+        let (pruner, spec, schema) = wrapped_truncate_pruner(&[Int, Long], Op::LtEq, -5);
+        let int_bounds = summary_manifest(
+            100_i32.to_le_bytes().to_vec(),
+            2147483600_i32.to_le_bytes().to_vec(),
+        );
+        assert!(pruner.manifest_might_match(&int_bounds, &spec, &schema));
+        // The same values in a manifest rewritten after the promotion.
+        let long_bounds = summary_manifest(
+            100_i64.to_le_bytes().to_vec(),
+            2147483600_i64.to_le_bytes().to_vec(),
+        );
+        assert!(pruner.manifest_might_match(&long_bounds, &spec, &schema));
+        assert!(!pruner.manifest_might_match(
+            &summary_manifest(
+                100_i64.to_le_bytes().to_vec(),
+                2147483500_i64.to_le_bytes().to_vec(),
+            ),
+            &spec,
+            &schema
+        ));
+
+        // Without an int history, values near `i32::MAX` are not wrapped.
+        let (pruner, spec, schema) = wrapped_truncate_pruner(&[Long], Op::LtEq, -5);
+        assert!(!pruner.manifest_might_match(&long_bounds, &spec, &schema));
     }
 
     #[test]
