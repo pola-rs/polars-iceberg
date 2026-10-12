@@ -330,13 +330,19 @@ pub fn initial_default_array(ty: &Type, json: &JsonValue) -> IcebergResult<Box<d
                 .boxed()
         },
         P::Time => {
-            let t = NaiveTime::parse_from_str(as_str()?, "%H:%M:%S%.f").map_err(|_| invalid())?;
+            // ISO-8601 local time, whose seconds are optional (as in Java's `LocalTime.parse`).
+            let s = as_str()?;
+            let t = NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+                .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M"))
+                .map_err(|_| invalid())?;
             let ns = i64::from(t.num_seconds_from_midnight()) * 1_000_000_000
                 + i64::from(t.nanosecond());
             PrimitiveArray::<i64>::from_slice([ns]).to(dtype).boxed()
         },
         P::Timestamp | P::TimestampNs => {
-            let ts = NaiveDateTime::parse_from_str(as_str()?, "%Y-%m-%dT%H:%M:%S%.f")
+            let s = as_str()?;
+            let ts = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
                 .map_err(|_| invalid())?
                 .and_utc();
             let v = if matches!(p, P::Timestamp) {
@@ -350,6 +356,7 @@ pub fn initial_default_array(ty: &Type, json: &JsonValue) -> IcebergResult<Box<d
             let s = as_str()?;
             let ts = DateTime::parse_from_rfc3339(s)
                 .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%:z"))
+                .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M%:z"))
                 .map_err(|_| invalid())?;
             let v = if matches!(p, P::Timestamptz) {
                 ts.timestamp_micros()
@@ -464,6 +471,30 @@ mod tests {
         let int = Type::Primitive(PrimitiveType::Int);
         assert!(initial_default_array(&int, &serde_json::json!(i32::MAX)).is_ok());
         assert!(initial_default_array(&int, &serde_json::json!(1_i64 << 32)).is_err());
+    }
+
+    #[test]
+    fn temporal_initial_defaults_without_seconds() {
+        let value = |p: PrimitiveType, s: &str| {
+            let array = initial_default_array(&Type::Primitive(p), &serde_json::json!(s)).unwrap();
+            array
+                .as_any()
+                .downcast_ref::<PrimitiveArray<i64>>()
+                .unwrap()
+                .value(0)
+        };
+
+        let ten_hours_us = 10 * 3600 * 1_000_000;
+        assert_eq!(value(PrimitiveType::Time, "10:00"), ten_hours_us * 1000);
+        assert_eq!(value(PrimitiveType::Time, "10:00:00"), ten_hours_us * 1000);
+        assert_eq!(
+            value(PrimitiveType::Timestamp, "1970-01-01T10:00"),
+            ten_hours_us
+        );
+        assert_eq!(
+            value(PrimitiveType::Timestamptz, "1970-01-01T11:00+01:00"),
+            ten_hours_us
+        );
     }
 
     #[test]
