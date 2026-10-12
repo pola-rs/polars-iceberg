@@ -565,6 +565,14 @@ fn null_column_statistics(field: &NestedField, n: usize) -> Vec<(String, Box<dyn
 fn datum_to_bytes(d: &Datum, ty: &Type) -> Vec<u8> {
     match d {
         Datum::Bool(b) => vec![u8::from(*b)],
+        // Decimal bounds are big-endian; a writer can store a decimal partition value as an
+        // Avro int or long.
+        Datum::Int(v) if matches!(ty, Type::Primitive(PrimitiveType::Decimal { .. })) => {
+            i128::from(*v).to_be_bytes().to_vec()
+        },
+        Datum::Long(v) if matches!(ty, Type::Primitive(PrimitiveType::Decimal { .. })) => {
+            i128::from(*v).to_be_bytes().to_vec()
+        },
         Datum::Int(v) => match ty {
             // Promoted int → long partition values.
             Type::Primitive(PrimitiveType::Long) => i64::from(*v).to_le_bytes().to_vec(),
@@ -590,6 +598,21 @@ mod tests {
 
     use super::*;
     use crate::iceberg::error::err_not_implemented;
+
+    #[test]
+    fn int_and_long_decimal_partition_values_are_big_endian() {
+        let decimal = Type::Primitive(PrimitiveType::Decimal {
+            precision: 9,
+            scale: 2,
+        });
+        for d in [Datum::Int(-150), Datum::Long(-150)] {
+            let bytes = datum_to_bytes(&d, &decimal);
+            assert_eq!(
+                crate::iceberg::values::decimal_from_be_bytes(&bytes, 9).unwrap(),
+                -150
+            );
+        }
+    }
 
     #[test]
     fn gzip_metadata_is_decompressed() {

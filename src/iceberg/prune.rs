@@ -36,7 +36,7 @@ pub struct Pruner {
 struct SpecProjection {
     filter: Bound,
     /// Per partition field: the maximum values of the integer types its source has had in any
-    /// schema, for detecting wrapped `truncate` values (see [`may_be_wrapped_truncate`]).
+    /// schema, for detecting wrapped `truncate` values (see [`may_hold_wrapped_truncate`]).
     int_maxes: Vec<Vec<i64>>,
 }
 
@@ -100,14 +100,22 @@ impl Pruner {
             };
             let idx = p.field_id as usize;
             let decode = |b: &Option<Vec<u8>>| b.as_deref().and_then(|b| decode_bound(b, &ty));
+            let lower = decode(&summary.lower_bound);
+            let upper = decode(&summary.upper_bound);
             // Wrapped values sort above every truncated value, so they can lie strictly between
-            // the bounds; an upper bound in their range is enough to suspect one.
-            let wrapped = [&summary.lower_bound, &summary.upper_bound]
+            // the bounds, also when the upper bound lies beyond their range (e.g. a merged
+            // manifest of files from before and after an int -> long promotion).
+            let wrapped = [&lower, &upper]
                 .into_iter()
-                .any(|b| decode(b).is_some_and(|v| is_wrapped_truncate(spec, idx, &v)))
-                || decode(&summary.upper_bound).is_some_and(|v| {
-                    may_be_wrapped_truncate(spec, idx, &projection.int_maxes[idx], &v)
-                });
+                .flatten()
+                .any(|v| is_wrapped_truncate(spec, idx, v))
+                || may_hold_wrapped_truncate(
+                    spec,
+                    idx,
+                    &projection.int_maxes[idx],
+                    lower.as_ref(),
+                    upper.as_ref(),
+                );
             wrapped || summary_might_match(p, summary, &ty)
         })
     }
@@ -183,22 +191,35 @@ fn is_wrapped_truncate(spec: &PartitionSpec, idx: usize, value: &Lit) -> bool {
     }
 }
 
-/// Whether a partition value of a `truncate` field lies in the range of wrapped values: a
-/// wrapped value `v - (v mod w) + 2^n` (for `v` within `w` of the minimum) is in
-/// `MAX - w + 2 ..= MAX`. Every integer type the source has had counts: after an int → long
-/// promotion, manifests written before it hold values wrapped within the int range.
-fn may_be_wrapped_truncate(
+/// Whether the partition values of a `truncate` field between `lower` and `upper` (unbounded if
+/// unknown) can hold a wrapped value: a wrapped value `v - (v mod w) + 2^n` (for `v` within `w`
+/// of the minimum) is in `MAX - w + 2 ..= MAX`. Every integer type the source has had counts:
+/// after an int → long promotion, manifests written before it hold values wrapped within the
+/// int range.
+fn may_hold_wrapped_truncate(
     spec: &PartitionSpec,
     idx: usize,
     int_maxes: &[i64],
-    value: &Lit,
+    lower: Option<&Lit>,
+    upper: Option<&Lit>,
 ) -> bool {
-    match (spec.fields.get(idx).map(|f| &f.transform), value) {
-        (Some(Transform::Truncate(width)), Lit::Int(v)) if *width > 0 => int_maxes
-            .iter()
-            .any(|max| *v > max - i64::from(*width) + 1 && v <= max),
-        _ => false,
+    let Some(Transform::Truncate(width)) = spec.fields.get(idx).map(|f| &f.transform) else {
+        return false;
+    };
+    if *width <= 0 {
+        return false;
     }
+    let as_int = |v: Option<&Lit>, unbounded: i64| match v {
+        None => Some(unbounded),
+        Some(Lit::Int(v)) => Some(*v),
+        Some(_) => None,
+    };
+    let (Some(lower), Some(upper)) = (as_int(lower, i64::MIN), as_int(upper, i64::MAX)) else {
+        return false;
+    };
+    int_maxes
+        .iter()
+        .any(|max| lower <= *max && upper > max - i64::from(*width) + 1)
 }
 
 /// Maximum values of the integer types a field has had across `schemas`.
@@ -985,9 +1006,26 @@ mod tests {
             &schema
         ));
 
+        // A manifest merged from files of before and after the promotion: its upper bound lies
+        // beyond the int range, with the wrapped value between the bounds.
+        let merged_bounds = summary_manifest(
+            2147483400_i64.to_le_bytes().to_vec(),
+            3000000000_i64.to_le_bytes().to_vec(),
+        );
+        assert!(pruner.manifest_might_match(&merged_bounds, &spec, &schema));
+        assert!(!pruner.manifest_might_match(
+            &summary_manifest(
+                2147483700_i64.to_le_bytes().to_vec(),
+                3000000000_i64.to_le_bytes().to_vec(),
+            ),
+            &spec,
+            &schema
+        ));
+
         // Without an int history, values near `i32::MAX` are not wrapped.
         let (pruner, spec, schema) = wrapped_truncate_pruner(&[Long], Op::LtEq, -5);
         assert!(!pruner.manifest_might_match(&long_bounds, &spec, &schema));
+        assert!(!pruner.manifest_might_match(&merged_bounds, &spec, &schema));
     }
 
     #[test]
