@@ -206,7 +206,7 @@ fn may_hold_wrapped_truncate(
     let Some(Transform::Truncate(width)) = spec.fields.get(idx).map(|f| &f.transform) else {
         return false;
     };
-    if *width <= 0 {
+    if *width == 0 {
         return false;
     }
     let as_int = |v: Option<&Lit>, unbounded: i64| match v {
