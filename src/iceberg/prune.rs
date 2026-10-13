@@ -222,17 +222,21 @@ fn may_hold_wrapped_truncate(
         .any(|max| lower <= *max && upper > max - i64::from(*width) + 1)
 }
 
-/// Maximum values of the integer types a field has had across `schemas`.
+/// Maximum values of the integer types a field may have had, judged from `schemas`. A long field
+/// counts as having been an int too: metadata cleanup can remove unused schemas, so the
+/// remaining ones do not prove that an int -> long promotion never happened.
 fn source_int_maxes(source_id: i32, schemas: &PlHashMap<i32, Arc<Schema>>) -> Vec<i64> {
     let mut maxes = vec![];
     for schema in schemas.values() {
-        let max = match schema.field_by_id(source_id).map(|f| &f.field_type) {
-            Some(Type::Primitive(PrimitiveType::Int)) => i64::from(i32::MAX),
-            Some(Type::Primitive(PrimitiveType::Long)) => i64::MAX,
+        let field_maxes: &[i64] = match schema.field_by_id(source_id).map(|f| &f.field_type) {
+            Some(Type::Primitive(PrimitiveType::Int)) => &[i32::MAX as i64],
+            Some(Type::Primitive(PrimitiveType::Long)) => &[i32::MAX as i64, i64::MAX],
             _ => continue,
         };
-        if !maxes.contains(&max) {
-            maxes.push(max);
+        for max in field_maxes {
+            if !maxes.contains(max) {
+                maxes.push(*max);
+            }
         }
     }
     maxes
@@ -1022,10 +1026,20 @@ mod tests {
             &schema
         ));
 
-        // Without an int history, values near `i32::MAX` are not wrapped.
+        // The int schema may have been removed by metadata cleanup, after which only the long
+        // schema remains. The manifests still hold the wrapped int value.
         let (pruner, spec, schema) = wrapped_truncate_pruner(&[Long], Op::LtEq, -5);
-        assert!(!pruner.manifest_might_match(&long_bounds, &spec, &schema));
-        assert!(!pruner.manifest_might_match(&merged_bounds, &spec, &schema));
+        assert!(pruner.manifest_might_match(&int_bounds, &spec, &schema));
+        assert!(pruner.manifest_might_match(&long_bounds, &spec, &schema));
+        assert!(pruner.manifest_might_match(&merged_bounds, &spec, &schema));
+        assert!(!pruner.manifest_might_match(
+            &summary_manifest(
+                100_i64.to_le_bytes().to_vec(),
+                2147483500_i64.to_le_bytes().to_vec(),
+            ),
+            &spec,
+            &schema
+        ));
     }
 
     #[test]
