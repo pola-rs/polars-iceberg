@@ -19,3 +19,6 @@ Repository = "https://github.com/pola-rs/polars-iceberg"
 [tool.maturin]
 features = ["python", "iceberg"]
 module-name = "polars_iceberg"
+# As a workspace member, the sdist gets the license only at `crates/polars-iceberg/LICENSE`, while
+# its metadata (`License-File: LICENSE`) points at the root, which PyPI rejects.
+include = [{ path = "LICENSE", format = "sdist" }]
