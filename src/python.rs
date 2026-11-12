@@ -14,7 +14,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyTuple};
 
 /// Plugin IDs exported by this build, oldest first.
-const PLUGIN_IDS: &[PluginId] = PluginId::ALL;
+const PLUGIN_IDS: &[PluginId] = &[
+    #[cfg(feature = "iceberg")]
+    PluginId::IcebergV1,
+];
 
 /// Returns the PyCapsule of the contract with the given plugin ID.
 #[pyfunction]
@@ -25,12 +28,23 @@ fn _capsule<'py>(py: Python<'py>, id: &str) -> PyResult<Bound<'py, PyCapsule>> {
             crate::PACKAGE_NAME
         )));
     };
-    let plugin: NonNull<std::ffi::c_void> = match plugin_id {
-        #[cfg(feature = "iceberg")]
-        PluginId::IcebergV1 => NonNull::from(&crate::iceberg::PLUGIN_V1).cast(),
-    };
-    // SAFETY: The struct is a static; the extension module is never unloaded.
-    unsafe { PyCapsule::new_with_pointer(py, plugin, plugin_id.name()) }
+    // Cargo can unify other plugins' contract features into the shared registry.
+    // Only this plugin's own contracts are advertised and dispatched here.
+    #[cfg(feature = "iceberg")]
+    if plugin_id == PluginId::IcebergV1 {
+        // SAFETY: The struct is a static; the extension module is never unloaded.
+        return unsafe {
+            PyCapsule::new_with_pointer(
+                py,
+                NonNull::from(&crate::iceberg::PLUGIN_V1).cast(),
+                plugin_id.name(),
+            )
+        };
+    }
+    Err(PyValueError::new_err(format!(
+        "{} does not provide plugin ID {id:?}",
+        crate::PACKAGE_NAME
+    )))
 }
 
 /// Returns a capsule with the `iceberg.v1` contract under a different name, for testing the
